@@ -140,30 +140,30 @@ las hasta `2 × per-host` URLs que ya estaban en ella).
 
 ## Hallazgos de dogfood
 
-Pendientes de registrar en `findings/` (campaña `raycrawl-1.27.95`):
+Registrados en `ray-apps/findings/` (campaña `raycrawl-1.27.95`), con su número entre paréntesis:
 
-1. **[E] std/charset** — `decode` es solo estricto: un byte malformado es `Err` con el offset dentro
+1. (#363) **[E] std/charset** — `decode` es solo estricto: un byte malformado es `Err` con el offset dentro
    del mensaje. Un navegador sustituye por U+FFFD; aquí hubo que reconstruir el modo con pérdida
    decodificando por tramos y extrayendo el offset del texto del error (`encoding.decode_lossy`).
-2. **[E] std/resilience** — `retry` reintenta cualquier `Err`: no hay predicado de "reintentable",
+2. (#364) **[E] std/resilience** — `retry` reintenta cualquier `Err`: no hay predicado de "reintentable",
    ni `Retry-After`, ni número de intento. Hubo que codificar "definitivo" como `Ok` y contar con una
    variable capturada.
-3. **[E] net/http** — no hay streaming sobre una conexión persistente (`stream_with` siempre abre
+3. (#370) **[E] net/http** — no hay streaming sobre una conexión persistente (`stream_with` siempre abre
    una conexión nueva con `Connection: close`; `pool`/`conn_*` bufferizan el cuerpo entero). Un
    crawler necesita las dos cosas (tope de bytes y keep-alive): a ~6.000 p/s se agotan los puertos
    efímeros.
-4. **[E] std/regex** — no hay `escape(literal)`; robots.txt necesita citar texto literal.
-5. **[E] std/url** — sin normalización RFC 3986 §6 (`%xx` en mayúsculas, decodificar no reservados,
+4. (#365) **[E] std/regex** — no hay `escape(literal)`; robots.txt necesita citar texto literal.
+5. (#366) **[E] std/url** — sin normalización RFC 3986 §6 (`%xx` en mayúsculas, decodificar no reservados,
    puerto por defecto) ni un escape de "lo que no puede ir crudo" para un `href` con espacios o
    no-ASCII: `url_encode` lo codifica todo, `/` incluida.
-6. **[E] net/webserver** — con `quiet()`, un cliente que cuelga a mitad de respuesta sigue
+6. (#371) **[E] net/webserver** — con `quiet()`, un cliente que cuelga a mitad de respuesta sigue
    escribiendo `response: Broken pipe (os error 32)` (o `Connection reset by peer`) en stderr.
-7. **[D] std/text** — `words` no corta en NBSP (U+00A0) y `trim` sí lo quita: dos criterios de
+7. (#367) **[D] std/text** — `words` no corta en NBSP (U+00A0) y `trim` sí lo quita: dos criterios de
    «espacio» en la misma librería, sin documentar.
-8. **[D] concurrencia** — `ray_doc try_join` es solo la firma; la doc de `spawn_isolated` no dice
+8. (#368) **[D] concurrencia** — `ray_doc try_join` es solo la firma; la doc de `spawn_isolated` no dice
    que los canales sí cruzan dominios ni que los hijos de `spawn_local` heredan el dominio (ambas
    cosas verificadas a mano).
-9. **[B] divergencia de mensaje VM/nativo** — un `tcp_accept` desde `spawn_isolated` sobre un
+9. (#369) **[B] divergencia de mensaje VM/nativo** — un `tcp_accept` desde `spawn_isolated` sobre un
    listener de otro dominio da `invalid handle: 1` en la VM y `handle 1 is not a listener` en nativo.
 
 Lo que salió bien: `spawn_isolated`, `spawn_local`, `scope` con cancelación, `try_join`, `try_call`,
