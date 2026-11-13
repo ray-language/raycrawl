@@ -1,0 +1,66 @@
+//! XML sitemaps (sitemaps.org 0.9): `<urlset>` and `<sitemapindex>`, gzipped or not, plus the
+//! plain-text form (one URL per line).
+
+import std/xml;
+import std/inflate;
+
+/// The most a (decompressed) sitemap may weigh: the protocol caps it at 50 MB.
+pub const MAX_SITEMAP_BYTES: int = 50 * 1024 * 1024;
+
+pub struct Entry {
+    loc: string,
+    lastmod: string,
+}
+
+pub struct Sitemap {
+    /// `true` for a `<sitemapindex>` (the entries are other sitemaps).
+    is_index: bool,
+    entries: [Entry],
+}
+
+/// Whether `b` starts with the gzip magic number.
+pub fn is_gzip(b: bytes) -> bool {
+    b.len() >= 2 && b[0] == 0x1F && b[1] == 0x8B
+}
+
+/// The body as text: gunzipped when it carries the gzip magic (whatever the URL says), with the
+/// 50 MB anti-bomb cap; a UTF-8 BOM is dropped.
+pub fn body_text(b: bytes) -> Result<string, string> {
+    let raw = if (is_gzip(b)) { inflate.gunzip_limit(b, MAX_SITEMAP_BYTES)? } else { b };
+    let start = if (raw.len() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) {
+        3
+    } else {
+        0
+    };
+    from_utf8(raw.sub_bytes(start, raw.len()))
+}
+
+/// Parses a sitemap body (bytes as fetched).
+pub fn parse(b: bytes) -> Result<Sitemap, string> {
+    let t = body_text(b)?;
+    let trimmed = t.trim();
+    if (!trimmed.starts_with("<")) {
+        var entries: [Entry] = [];
+        for line in trimmed.split("\n") {
+            let l = line.trim();
+            if (l.starts_with("http://") || l.starts_with("https://")) {
+                entries.push(Entry { loc: l, lastmod: "" });
+            }
+        }
+        return Result.Ok(Sitemap { is_index: false, entries: entries });
+    }
+    let root = xml.parse(t)?;
+    let is_index = root.local == "sitemapindex";
+    if (!is_index && root.local != "urlset") {
+        return Result.Err("not a sitemap: root element <${root.name}>");
+    }
+    let item = if (is_index) { "sitemap" } else { "url" };
+    var entries: [Entry] = [];
+    for e in xml.children_named(root, item) {
+        let loc = xml.text_of(e, "loc").trim();
+        if (loc != "") {
+            entries.push(Entry { loc: loc, lastmod: xml.text_of(e, "lastmod").trim() });
+        }
+    }
+    Result.Ok(Sitemap { is_index: is_index, entries: entries })
+}

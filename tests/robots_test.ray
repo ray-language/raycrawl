@@ -1,0 +1,91 @@
+import robots;
+
+const UA: string = "raycrawl/0.1 (+https://example.org/bot)";
+
+const SAMPLE: string = `# comment
+User-agent: *
+Disallow: /private/
+Allow: /private/open.html
+Disallow: /*.pdf$
+Disallow: /tmp*
+
+User-agent: RayCrawl
+User-agent: otherbot
+Disallow: /secret
+Allow: /secret/public
+Crawl-delay: 0.25
+
+User-agent: badbot
+Disallow: /
+
+Sitemap: http://example.org/sitemap.xml
+sitemap: http://example.org/news.xml
+`;
+
+@test
+fn parses_groups_and_sitemaps() {
+    let r = robots.parse(SAMPLE);
+    assert_eq(r.groups.len(), 3);
+    assert_eq(r.groups[1].agents, ["raycrawl", "otherbot"]);
+    assert_eq(r.sitemaps, ["http://example.org/sitemap.xml", "http://example.org/news.xml"]);
+    assert_eq(robots.product_token(UA), "raycrawl");
+}
+
+@test
+fn specific_group_wins_over_star() {
+    let p = robots.policy_for(robots.parse(SAMPLE), UA);
+    assert_eq(p.matched, "raycrawl");
+    assert_eq(p.crawl_delay_ms, Option.Some(250));
+    // The * group does not apply: /private/ is allowed for raycrawl.
+    assert(robots.allowed(p, "/private/x"));
+    assert(!robots.allowed(p, "/secret"));
+    assert(!robots.allowed(p, "/secretive"));
+    assert(robots.allowed(p, "/secret/public/a"));
+}
+
+@test
+fn star_group_longest_match_and_wildcards() {
+    let p = robots.policy_for(robots.parse(SAMPLE), "somebot/2.0");
+    assert_eq(p.matched, "*");
+    assert(!robots.allowed(p, "/private/x"));
+    assert(robots.allowed(p, "/private/open.html"));
+    assert(!robots.allowed(p, "/doc/a.pdf"));
+    assert(robots.allowed(p, "/doc/a.pdf?x=1"));
+    assert(!robots.allowed(p, "/tmpfile"));
+    assert(robots.allowed(p, "/robots.txt"));
+    assert_eq(robots.deciding_rule(p, "/private/open.html"), "Allow: /private/open.html");
+}
+
+@test
+fn allow_wins_a_tie() {
+    let p = robots.policy_for(robots.parse("User-agent: *\nDisallow: /page\nAllow: /page\n"), UA);
+    assert(robots.allowed(p, "/page"));
+}
+
+@test
+fn regex_metacharacters_are_literal() {
+    let p = robots.policy_for(
+        robots.parse("User-agent: *\nDisallow: /a+b(c)$\nDisallow: /q?x=\n"),
+        UA
+    );
+    assert(!robots.allowed(p, "/a+b(c)"));
+    assert(robots.allowed(p, "/aab(c)"));
+    assert(!robots.allowed(p, "/q?x=1"));
+}
+
+@test
+fn empty_disallow_and_unreachable() {
+    let p = robots.policy_for(robots.parse("User-agent: *\nDisallow:\n"), UA);
+    assert(robots.allowed(p, "/anything"));
+    let none = robots.policy_for(robots.disallow_all(), UA);
+    assert(!robots.allowed(none, "/anything"));
+    assert(robots.allowed(none, "/robots.txt"));
+    let all = robots.policy_for(robots.allow_all("missing"), UA);
+    assert(robots.allowed(all, "/x"));
+}
+
+@test
+fn percent_encoding_is_compared_normalized() {
+    let p = robots.policy_for(robots.parse("User-agent: *\nDisallow: /%7ejoe/\n"), UA);
+    assert(!robots.allowed(p, "/~joe/index.html"));
+}

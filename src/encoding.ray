@@ -1,0 +1,174 @@
+//! Charset detection and decoding to UTF-8, in the HTML order of precedence: byte order mark,
+//! then the HTTP `Content-Type` charset, then a `<meta charset>` / `http-equiv` in the first
+//! 1024 bytes, then UTF-8 — and windows-1252 when the bytes are not valid UTF-8.
+
+import std/charset;
+import std/regex;
+
+pub struct Decoded {
+    text: string,
+    /// The canonical-ish label that decoded it (as found, lowercased).
+    label: string,
+    /// Where the label came from: "bom", "header", "meta", "default" or "fallback".
+    source: string,
+    /// Malformed sequences replaced by U+FFFD.
+    replaced: int,
+}
+
+/// The charset of a BOM at the start of `b` and its length.
+pub fn sniff_bom(b: bytes) -> Option<(string, int)> {
+    if (b.len() >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+        return Option.Some(("utf-8", 3));
+    }
+    if (b.len() >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
+        return Option.Some(("utf-16le", 2));
+    }
+    if (b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
+        return Option.Some(("utf-16be", 2));
+    }
+    Option.None
+}
+
+/// The `charset=` parameter of a Content-Type value, unquoted and lowercased.
+pub fn header_charset(content_type: string) -> Option<string> {
+    for part in content_type.split(";") {
+        let p = part.trim();
+        if (p.to_lower().starts_with("charset=")) {
+            var v = p.substring(8, p.len()).trim();
+            if (v.starts_with("\"") || v.starts_with("'")) {
+                v = v.substring(1, v.len());
+            }
+            if (v.ends_with("\"") || v.ends_with("'")) {
+                v = v.substring(0, v.len() - 1);
+            }
+            v = v.trim().to_lower();
+            if (v != "") {
+                return Option.Some(v);
+            }
+        }
+    }
+    Option.None
+}
+
+/// The first 1024 bytes as ASCII text (other octets become `?`): enough to find a `<meta>`
+/// whatever the real encoding is, as the HTML prescan does.
+fn ascii_prefix(b: bytes) -> string {
+    let n = if (b.len() < 1024) { b.len() } else { 1024 };
+    var cs: [int] = [];
+    var i = 0;
+    while (i < n) {
+        let o = b[i];
+        cs.push(if (o < 128 && o != 0) { o } else { 63 });
+        i = i + 1;
+    }
+    from_utf8(bytes_of(cs)).unwrap_or("")
+}
+
+const META_RE: string = "<[mM][eE][tT][aA][^>]*[cC][hH][aA][rR][sS][eE][tT]\\s*=\\s*[\"']?\\s*([-A-Za-z0-9_:.]+)";
+
+/// The charset a `<meta charset=…>` or `<meta http-equiv="Content-Type" content="…;
+/// charset=…">` declares in the first 1024 bytes.
+pub fn meta_charset(b: bytes) -> Option<string> {
+    let head = ascii_prefix(b);
+    let re = match (regex.compile(META_RE)) {
+        Result.Ok(r) => r,
+        Result.Err(_) => return Option.None,
+    };
+    match (re.captures_str(head)) {
+        Option.Some(groups) => match (groups[1]) {
+            Option.Some(v) => Option.Some(v.to_lower()),
+            Option.None => Option.None,
+        },
+        Option.None => Option.None,
+    }
+}
+
+/// The byte offset in a `charset.decode` error ("… at byte N"), if it says one.
+fn error_offset(e: string) -> Option<int> {
+    match (e.last_index_of("at byte ")) {
+        Option.Some(i) => parse_int(e.substring(i + 8, e.len()).trim()),
+        Option.None => Option.None,
+    }
+}
+
+/// Decodes like a browser: a malformed sequence becomes U+FFFD and decoding goes on.
+/// `charset.decode` is strict (an `Err` with the offset), so the lossy mode is rebuilt here:
+/// decode up to the bad byte, emit U+FFFD, skip one byte, repeat. `Err` = unknown label.
+pub fn decode_lossy(b: bytes, label: string) -> Result<(string, int), string> {
+    var parts: [string] = [];
+    var rest = b;
+    var replaced = 0;
+    while (true) {
+        match (charset.decode(rest, label)) {
+            Result.Ok(s) => {
+                parts.push(s);
+                break;
+            },
+            Result.Err(e) => {
+                let at = match (error_offset(e)) {
+                    Option.Some(n) => n,
+                    Option.None => return Result.Err(e),
+                };
+                if (at > 0) {
+                    let head = charset.decode(rest.sub_bytes(0, at), label)?;
+                    parts.push(head);
+                }
+                parts.push("\u{FFFD}");
+                replaced = replaced + 1;
+                rest = rest.sub_bytes(at + 1, rest.len());
+                if (rest.len() == 0) {
+                    break;
+                }
+            },
+        }
+    }
+    Result.Ok((parts.join(""), replaced))
+}
+
+fn known(label: string) -> bool {
+    charset.decode(bytes_of([]), label).is_ok()
+}
+
+/// Detects the charset of an HTML (or text) body and decodes it to a string.
+pub fn decode_body(body: bytes, content_type: string) -> Decoded {
+    if let Option.Some((label, skip)) = sniff_bom(body) {
+        let (text, bad) = decode_lossy(body.sub_bytes(skip, body.len()), label).unwrap_or(("", 0));
+        return Decoded { text: text, label: label, source: "bom", replaced: bad };
+    }
+    var label = "utf-8";
+    var source = "default";
+    match (header_charset(content_type)) {
+        Option.Some(h) if known(h) => {
+            label = h;
+            source = "header";
+        },
+        _ => {
+            if let Option.Some(m) = meta_charset(body) {
+                if (known(m)) {
+                    label = m;
+                    source = "meta";
+                }
+            }
+        },
+    }
+    // A UTF-16 label in a meta is a lie by definition (the prescan read ASCII): HTML says utf-8.
+    if (source == "meta" && label.starts_with("utf-16")) {
+        label = "utf-8";
+    }
+    if (source == "default") {
+        match (charset.decode(body, "utf-8")) {
+            Result.Ok(t) => return Decoded { text: t, label: "utf-8", source: "default", replaced: 0 },
+            Result.Err(_) => {
+                let (t, bad) = decode_lossy(body, "windows-1252").unwrap_or(("", 0));
+                return Decoded {
+                    text: t,
+                    label: "windows-1252",
+                    source: "fallback",
+                    replaced: bad
+                };
+            },
+        }
+    }
+    let (text, bad) = decode_lossy(body, label).unwrap_or(("", 0));
+    Decoded { text: text, label: label, source: source, replaced: bad }
+}

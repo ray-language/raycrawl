@@ -1,0 +1,79 @@
+import std/charset;
+import encoding;
+
+fn enc(s: string, label: string) -> bytes {
+    charset.encode(s, label).unwrap()
+}
+
+@test
+fn header_charset_param() {
+    assert_eq(encoding.header_charset("text/html; charset=ISO-8859-1"), Option.Some("iso-8859-1"));
+    assert_eq(encoding.header_charset("text/html;charset=\"Shift_JIS\""), Option.Some("shift_jis"));
+    assert_eq(encoding.header_charset("text/html"), Option.None);
+}
+
+@test
+fn meta_charset_both_forms() {
+    let a = "<html><head><META charset='windows-1252'>".to_bytes();
+    assert_eq(encoding.meta_charset(a), Option.Some("windows-1252"));
+    let b = "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=Shift_JIS\">".to_bytes();
+    assert_eq(encoding.meta_charset(b), Option.Some("shift_jis"));
+    assert_eq(encoding.meta_charset("<p>charset=x</p>".to_bytes()), Option.None);
+}
+
+@test
+fn header_beats_meta_and_bom_beats_header() {
+    let body = enc("<meta charset=utf-8><p>Café</p>", "iso-8859-1");
+    let d = encoding.decode_body(body, "text/html; charset=iso-8859-1");
+    assert_eq(d.source, "header");
+    assert(d.text.contains("Café"));
+    let bom = bytes_concat([bytes_of([0xEF, 0xBB, 0xBF]), "<p>Ñandú</p>".to_bytes()]);
+    let d2 = encoding.decode_body(bom, "text/html; charset=iso-8859-1");
+    assert_eq(d2.source, "bom");
+    assert_eq(d2.text, "<p>Ñandú</p>");
+}
+
+@test
+fn meta_shift_jis_and_windows_1252() {
+    let sj = bytes_concat(
+        [
+            "<meta charset=\"Shift_JIS\"><title>".to_bytes(),
+            enc("日本語のページ", "shift_jis"),
+            "</title>".to_bytes()
+        ]
+    );
+    let d = encoding.decode_body(sj, "text/html");
+    assert_eq(d.source, "meta");
+    assert_eq(d.label, "shift_jis");
+    assert(d.text.contains("日本語のページ"));
+    // 0x80 is the euro sign and 0x93/0x94 the curly quotes in windows-1252.
+    let w = bytes_concat(
+        ["<meta charset=windows-1252>".to_bytes(), bytes_of([0x80, 0x93, 0x41, 0x94])]
+    );
+    let d2 = encoding.decode_body(w, "");
+    assert(d2.text.ends_with("€“A”"));
+}
+
+@test
+fn invalid_utf8_falls_back_to_windows_1252() {
+    let d = encoding.decode_body(bytes_of([0x43, 0x61, 0x66, 0xE9]), "text/html");
+    assert_eq(d.source, "fallback");
+    assert_eq(d.text, "Café");
+}
+
+@test
+fn utf16_bom() {
+    let d = encoding.decode_body(bytes_of([0xFF, 0xFE, 0x48, 0x00, 0x69, 0x00]), "");
+    assert_eq(d.label, "utf-16le");
+    assert_eq(d.text, "Hi");
+}
+
+@test
+fn lossy_decode_replaces_bad_bytes() {
+    let bad = bytes_concat([enc("あ", "shift_jis"), bytes_of([0xFF]), enc("い", "shift_jis")]);
+    let (t, n) = encoding.decode_lossy(bad, "shift_jis").unwrap();
+    assert_eq(n, 1);
+    assert_eq(t, "あ\u{FFFD}い");
+    let d = encoding.decode_body(bytes_concat(["<meta charset=shift_jis>".to_bytes(), bad]), "");
+    assert_eq(d.replaced, 1);
+}

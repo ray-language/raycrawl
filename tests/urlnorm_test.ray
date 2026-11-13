@@ -1,0 +1,56 @@
+import urlnorm;
+
+fn norm(s: string) -> string {
+    match (urlnorm.normalize(s)) {
+        Result.Ok(v) => v,
+        Result.Err(e) => "ERR ${e}",
+    }
+}
+
+@test
+fn normalize_case_port_fragment() {
+    assert_eq(norm("HTTP://Example.COM:80/a/b#frag"), "http://example.com/a/b");
+    assert_eq(norm("https://example.com:443"), "https://example.com/");
+    assert_eq(norm("https://example.com:8443/x?"), "https://example.com:8443/x");
+    assert_eq(norm("http://example.com./"), "http://example.com/");
+}
+
+@test
+fn normalize_dots_and_percent() {
+    assert_eq(norm("http://h/a/./b/../c"), "http://h/a/c");
+    assert_eq(norm("http://h/%7euser/%2fx%2F"), "http://h/~user/%2Fx%2F");
+    assert_eq(norm("http://h/a b/ñ"), "http://h/a%20b/%C3%B1");
+    assert_eq(norm("http://h/?q=%41%3d"), "http://h/?q=A%3D");
+    assert_eq(norm("http://h/100%"), "http://h/100%25");
+}
+
+@test
+fn normalize_rejects_other_schemes() {
+    assert(norm("mailto:a@b.c").starts_with("ERR"));
+    assert(norm("javascript:void(0)").starts_with("ERR"));
+    assert(norm("/relative").starts_with("ERR"));
+}
+
+@test
+fn resolve_relative_links() {
+    let base = "http://h:8080/dir/page.html?x=1";
+    assert_eq(urlnorm.resolve(base, "other.html").unwrap(), "http://h:8080/dir/other.html");
+    assert_eq(urlnorm.resolve(base, "../up").unwrap(), "http://h:8080/up");
+    assert_eq(urlnorm.resolve(base, "?y=2").unwrap(), "http://h:8080/dir/page.html?y=2");
+    assert_eq(urlnorm.resolve(base, "#top").unwrap(), "http://h:8080/dir/page.html?x=1");
+    assert_eq(urlnorm.resolve(base, "//other.org").unwrap(), "http://other.org/");
+    assert_eq(urlnorm.resolve(base, "  /sp ace\n").unwrap(), "http://h:8080/sp%20ace");
+}
+
+@test
+fn origin_and_scope() {
+    assert_eq(urlnorm.origin("http://h:8080/a?b"), "http://h:8080");
+    assert_eq(urlnorm.origin("https://h/a"), "https://h");
+    assert_eq(urlnorm.path_query("http://h:8080/a?b=1"), "/a?b=1");
+    assert(urlnorm.in_scope("host", "http://a.com/", "https://a.com/x"));
+    assert(!urlnorm.in_scope("host", "http://a.com/", "http://b.a.com/x"));
+    assert(urlnorm.in_scope("domain", "http://www.a.com/", "http://blog.a.com/x"));
+    assert(urlnorm.in_scope("prefix", "http://a.com/docs/", "http://a.com/docs/x"));
+    assert(!urlnorm.in_scope("prefix", "http://a.com/docs/", "http://a.com/blog"));
+    assert_eq(urlnorm.site_of("127.0.0.1"), "127.0.0.1");
+}

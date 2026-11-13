@@ -1,0 +1,369 @@
+//! A forgiving HTML scanner — not a tree builder: it walks the tags once and pulls out what a
+//! crawler needs (title, links, `<base>`, canonical, meta robots) plus the visible text.
+
+import std/text;
+import std/collections/stringbuilder;
+
+pub struct Link {
+    href: string,
+    nofollow: bool,
+}
+
+pub struct Doc {
+    title: string,
+    links: [Link],
+    base: Option<string>,
+    canonical: Option<string>,
+    /// `<meta name="robots">` says noindex / nofollow.
+    noindex: bool,
+    nofollow: bool,
+    /// Visible text, whitespace collapsed and NFC-normalized.
+    text: string,
+}
+
+/// The attributes of one tag, names lowercased, values entity-decoded.
+struct Tag {
+    name: string,
+    closing: bool,
+    attrs: Map<string, string>,
+    end: int,
+}
+
+fn is_space(c: char) -> bool {
+    c == ' ' || c == '\n' || c == '\t' || c == '\r' || c == '\u{c}'
+}
+
+fn is_name_char(c: char) -> bool {
+    let n = char_code(c);
+    (n >= 97 && n <= 122)
+        || (n >= 65 && n <= 90)
+        || (n >= 48 && n <= 57)
+        || c == '-'
+        || c == '_'
+        || c == ':'
+}
+
+const NAMED: [(string, string)] = [
+    ("amp", "&"),
+    ("lt", "<"),
+    ("gt", ">"),
+    ("quot", "\""),
+    ("apos", "'"),
+    ("nbsp", "\u{A0}"),
+    ("copy", "©"),
+    ("reg", "®"),
+    ("hellip", "…"),
+    ("mdash", "—"),
+    ("ndash", "–"),
+    ("laquo", "«"),
+    ("raquo", "»"),
+    ("euro", "€")
+];
+
+fn named_entity(name: string) -> Option<string> {
+    for (k, v) in NAMED {
+        if (k == name) {
+            return Option.Some(v);
+        }
+    }
+    Option.None
+}
+
+fn parse_code(digits: string, hex: bool) -> Option<int> {
+    if (digits == "" || digits.len() > 8) {
+        return Option.None;
+    }
+    var n = 0;
+    for c in digits.to_lower().chars() {
+        let v = char_code(c);
+        let d = if (v >= 48 && v <= 57) {
+            v - 48
+        } else if (hex && v >= 97 && v <= 102) {
+            v - 87
+        } else {
+            return Option.None;
+        };
+        n = n * if (hex) { 16 } else { 10 } + d;
+    }
+    Option.Some(n)
+}
+
+/// Decodes `&amp;`, `&#233;`, `&#xE9;` and a few named entities; anything else stays as written.
+pub fn decode_entities(s: string) -> string {
+    if (!s.contains("&")) {
+        return s;
+    }
+    let sb = stringbuilder.new();
+    var i = 0;
+    while (i < s.len()) {
+        let amp = match (s.index_of_from("&", i)) {
+            Option.Some(a) => a,
+            Option.None => {
+                sb.push(s.substring(i, s.len()));
+                break;
+            },
+        };
+        sb.push(s.substring(i, amp));
+        let semi = match (s.index_of_from(";", amp)) {
+            Option.Some(x) if (x - amp <= 10) => x,
+            _ => {
+                sb.push("&");
+                i = amp + 1;
+                continue;
+            },
+        };
+        let body = s.substring(amp + 1, semi);
+        var out: Option<string> = Option.None;
+        if (body.starts_with("#x") || body.starts_with("#X")) {
+            if let Option.Some(n) = parse_code(body.substring(2, body.len()), true) {
+                out = char_from_code(n).map(fn(c: char) -> string { to_string(c) });
+            }
+        } else if (body.starts_with("#")) {
+            if let Option.Some(n) = parse_code(body.substring(1, body.len()), false) {
+                out = char_from_code(n).map(fn(c: char) -> string { to_string(c) });
+            }
+        } else {
+            out = named_entity(body);
+        }
+        match (out) {
+            Option.Some(v) => {
+                sb.push(v);
+                i = semi + 1;
+            },
+            Option.None => {
+                sb.push("&");
+                i = amp + 1;
+            },
+        }
+    }
+    sb.build()
+}
+
+/// Parses the tag that starts at `s[lt]` (`<`). `None` when it is not a tag (`a < b`).
+fn read_tag(s: string, lt: int) -> Option<Tag> {
+    let n = s.len();
+    var i = lt + 1;
+    var closing = false;
+    if (i < n && s[i] == '/') {
+        closing = true;
+        i = i + 1;
+    }
+    let start = i;
+    while (i < n && is_name_char(s[i])) {
+        i = i + 1;
+    }
+    if (i == start) {
+        return Option.None;
+    }
+    let name = s.substring(start, i).to_lower();
+    let attrs: Map<string, string> = Map.new();
+    while (i < n) {
+        while (i < n && (is_space(s[i]) || s[i] == '/')) {
+            i = i + 1;
+        }
+        if (i >= n) {
+            break;
+        }
+        if (s[i] == '>') {
+            return Option.Some(Tag { name: name, closing: closing, attrs: attrs, end: i + 1 });
+        }
+        let a0 = i;
+        while (i < n && !is_space(s[i]) && s[i] != '=' && s[i] != '>' && s[i] != '/') {
+            i = i + 1;
+        }
+        let aname = s.substring(a0, i).to_lower();
+        while (i < n && is_space(s[i])) {
+            i = i + 1;
+        }
+        var value = "";
+        if (i < n && s[i] == '=') {
+            i = i + 1;
+            while (i < n && is_space(s[i])) {
+                i = i + 1;
+            }
+            if (i < n && (s[i] == '"' || s[i] == '\'')) {
+                let q = s[i];
+                let v0 = i + 1;
+                let close = s.index_of_from(to_string(q), v0).unwrap_or(n);
+                value = s.substring(v0, close);
+                i = close + 1;
+            } else {
+                let v0 = i;
+                while (i < n && !is_space(s[i]) && s[i] != '>') {
+                    i = i + 1;
+                }
+                value = s.substring(v0, i);
+            }
+        }
+        if (aname != "" && !attrs.contains_key(aname)) {
+            attrs.insert(aname, decode_entities(value));
+        }
+        if (i == a0) {
+            i = i + 1;
+        }
+    }
+    Option.Some(Tag { name: name, closing: closing, attrs: attrs, end: n })
+}
+
+/// The index right after the closing `</name ...>` from `from`, matched case-insensitively.
+fn skip_raw_text(s: string, from: int, name: string) -> (int, int) {
+    var i = from;
+    while (true) {
+        let lt = match (s.index_of_from("</", i)) {
+            Option.Some(x) => x,
+            Option.None => return (s.len(), s.len()),
+        };
+        if (s.substring(lt + 2, lt + 2 + name.len()).to_lower() == name) {
+            let gt = s.index_of_from(">", lt).unwrap_or(s.len() - 1);
+            return (lt, gt + 1);
+        }
+        i = lt + 2;
+    }
+}
+
+fn has_token(value: string, token: string) -> bool {
+    for t in value.to_lower().replace(",", " ").split(" ") {
+        if (t.trim() == token) {
+            return true;
+        }
+    }
+    false
+}
+
+const BLOCK: [string] = [
+    "p",
+    "div",
+    "br",
+    "li",
+    "ul",
+    "ol",
+    "tr",
+    "td",
+    "th",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "nav",
+    "table",
+    "title",
+    "blockquote",
+    "pre"
+];
+
+/// Collapses runs of whitespace (including NBSP) to one space and NFC-normalizes.
+pub fn clean_text(s: string) -> string {
+    text.nfc(text.words(s.replace("\u{A0}", " ")).join(" "))
+}
+
+/// Scans a decoded HTML document.
+pub fn parse(s: string) -> Doc {
+    var title = "";
+    var links: [Link] = [];
+    var base: Option<string> = Option.None;
+    var canonical: Option<string> = Option.None;
+    var noindex = false;
+    var nofollow = false;
+    let txt = stringbuilder.new();
+    let n = s.len();
+    var i = 0;
+    while (i < n) {
+        let lt = match (s.index_of_from("<", i)) {
+            Option.Some(x) => x,
+            Option.None => n,
+        };
+        if (lt > i) {
+            txt.push(s.substring(i, lt));
+        }
+        if (lt >= n) {
+            break;
+        }
+        if (s.substring(lt, lt + 4) == "<!--") {
+            i = match (s.index_of_from("-->", lt + 4)) {
+                Option.Some(e) => e + 3,
+                Option.None => n,
+            };
+            continue;
+        }
+        if (lt + 1 < n && (s[lt + 1] == '!' || s[lt + 1] == '?')) {
+            i = s.index_of_from(">", lt).unwrap_or(n - 1) + 1;
+            continue;
+        }
+        let tag = match (read_tag(s, lt)) {
+            Option.Some(t) => t,
+            Option.None => {
+                txt.push("<");
+                i = lt + 1;
+                continue;
+            },
+        };
+        i = tag.end;
+        if (tag.closing) {
+            if (BLOCK.contains(tag.name)) {
+                txt.push(" ");
+            }
+            continue;
+        }
+        let name = tag.name;
+        if (name == "script" || name == "style" || name == "noscript" || name == "template") {
+            let (_, after) = skip_raw_text(s, i, name);
+            i = after;
+            continue;
+        }
+        if (name == "title") {
+            let (stop, after) = skip_raw_text(s, i, "title");
+            if (title == "") {
+                title = clean_text(decode_entities(s.substring(i, stop)));
+            }
+            i = after;
+            continue;
+        }
+        if (BLOCK.contains(name)) {
+            txt.push(" ");
+        }
+        if (name == "a" || name == "area") {
+            if let Option.Some(h) = tag.attrs.get("href") {
+                let rel = tag.attrs.get_or("rel", "");
+                links.push(Link { href: h, nofollow: has_token(rel, "nofollow") });
+            }
+        } else if (name == "base") {
+            if (base.is_none()) {
+                base = tag.attrs.get("href");
+            }
+        } else if (name == "link") {
+            if (has_token(tag.attrs.get_or("rel", ""), "canonical")) {
+                canonical = tag.attrs.get("href");
+            }
+        } else if (name == "meta") {
+            let mname = tag.attrs.get_or("name", "").to_lower();
+            if (mname == "robots" || mname == "raycrawl") {
+                let content = tag.attrs.get_or("content", "");
+                if (has_token(content, "noindex") || has_token(content, "none")) {
+                    noindex = true;
+                }
+                if (has_token(content, "nofollow") || has_token(content, "none")) {
+                    nofollow = true;
+                }
+            }
+        } else if (name == "frame" || name == "iframe") {
+            if let Option.Some(h) = tag.attrs.get("src") {
+                links.push(Link { href: h, nofollow: false });
+            }
+        }
+    }
+    Doc {
+        title: title,
+        links: links,
+        base: base,
+        canonical: canonical,
+        noindex: noindex,
+        nofollow: nofollow,
+        text: clean_text(decode_entities(txt.build()))
+    }
+}

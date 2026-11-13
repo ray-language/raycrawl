@@ -1,0 +1,69 @@
+//! Crawl settings (from the command line) and their defaults.
+
+pub const VERSION: string = "0.1.0";
+
+@derive(Clone)
+pub struct Config {
+    user_agent: string,
+    max_depth: int,
+    max_pages: int,
+    /// Fetchers per host (concurrent requests to one origin).
+    per_host: int,
+    /// Hosts crawled at the same time.
+    max_hosts: int,
+    /// Minimum gap between two request starts to one host, in ms (robots Crawl-delay may raise it).
+    delay_ms: int,
+    /// Highest Crawl-delay honoured, in ms (a robots.txt asking for an hour is capped).
+    max_delay_ms: int,
+    /// Budget of one attempt (connect + head + body), in ms.
+    timeout_ms: int,
+    /// Retries after the first attempt, for 5xx/429/timeouts.
+    retries: int,
+    backoff_ms: int,
+    max_redirects: int,
+    /// Bodies beyond this are cut (the page is kept, marked truncated).
+    max_bytes: int,
+    /// "host", "domain", "prefix" or "any".
+    scope: string,
+    respect_robots: bool,
+    use_sitemaps: bool,
+    /// Characters of visible text kept per page in the JSONL (0 = none).
+    text_chars: int,
+    /// Write every outgoing link in the JSONL.
+    emit_links: bool,
+    /// Consecutive failures that open a host's circuit breaker, and how long it stays open.
+    breaker_threshold: int,
+    breaker_cooldown_ms: int,
+    /// A whole crawl's wall-clock budget, in ms (0 = none).
+    max_time_ms: int,
+    /// Fault injection for tests: a host worker panics when asked for a URL containing this.
+    crash_marker: string,
+    quiet: bool,
+}
+
+pub fn defaults() -> Config {
+    Config {
+        user_agent: "raycrawl/${VERSION} (+https://github.com/ray-language/raycrawl)",
+        max_depth: 3,
+        max_pages: 500,
+        per_host: 2,
+        max_hosts: 8,
+        delay_ms: 250,
+        max_delay_ms: 30000,
+        timeout_ms: 10000,
+        retries: 2,
+        backoff_ms: 200,
+        max_redirects: 5,
+        max_bytes: 2 * 1024 * 1024,
+        scope: "host",
+        respect_robots: true,
+        use_sitemaps: false,
+        text_chars: 300,
+        emit_links: false,
+        breaker_threshold: 5,
+        breaker_cooldown_ms: 5000,
+        max_time_ms: 0,
+        crash_marker: "",
+        quiet: false
+    }
+}

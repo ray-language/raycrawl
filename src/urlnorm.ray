@@ -1,0 +1,226 @@
+//! URL normalization, dedup keys and crawl scope rules.
+//!
+//! `normalize` turns whatever a page links to into the one canonical spelling the crawler
+//! dedups on: lowercase scheme and host, no default port, dot segments removed, percent-encoding
+//! with uppercase hex (and unreserved characters decoded), no fragment, an empty path as `/`.
+
+import std/url;
+
+const HEX: string = "0123456789ABCDEF";
+
+/// The parts of a normalized absolute http(s) URL the crawler reasons about.
+pub struct Parts {
+    scheme: string,
+    host: string,
+    port: int,
+    path_query: string,
+}
+
+fn hex_value(c: char) -> int {
+    let n = char_code(c);
+    if (n >= 48 && n <= 57) {
+        return n - 48;
+    }
+    if (n >= 65 && n <= 70) {
+        return n - 55;
+    }
+    if (n >= 97 && n <= 102) {
+        return n - 87;
+    }
+    -1
+}
+
+fn is_unreserved(n: int) -> bool {
+    (n >= 65 && n <= 90)
+        || (n >= 97 && n <= 122)
+        || (n >= 48 && n <= 57)
+        || n == 45
+        || n == 46
+        || n == 95
+        || n == 126
+}
+
+fn pct(n: int) -> string {
+    "%${HEX[n / 16]}${HEX[n % 16]}"
+}
+
+/// Percent-encodes what may not appear raw in a URL: controls, space, non-ASCII (as UTF-8
+/// octets) and the characters RFC 3986 never allows (`"<>\^`{|}`). Leading/trailing whitespace
+/// is dropped and tabs/newlines inside are removed, as browsers do with an `href`.
+pub fn escape_unsafe(raw: string) -> string {
+    var out = "";
+    for c in raw.trim().chars() {
+        let n = char_code(c);
+        if (n == 9 || n == 10 || n == 13) {
+            continue;
+        }
+        if (n <= 32 || n >= 127 || "\"<>\\^`{|}".contains(to_string(c))) {
+            for b in to_string(c).to_bytes() {
+                out = out + pct(b);
+            }
+        } else {
+            out = out + to_string(c);
+        }
+    }
+    out
+}
+
+/// Uppercases the hex of every `%XX` and decodes the ones that stand for unreserved characters
+/// (`%7E` → `~`, `%41` → `A`); a lone `%` becomes `%25`.
+pub fn normalize_percent(s: string) -> string {
+    if (!s.contains("%")) {
+        return s;
+    }
+    let cs = s.chars();
+    var out = "";
+    var i = 0;
+    while (i < cs.len()) {
+        let c = cs[i];
+        if (c == '%') {
+            if (i + 2 < cs.len() && hex_value(cs[i + 1]) >= 0 && hex_value(cs[i + 2]) >= 0) {
+                let v = hex_value(cs[i + 1]) * 16 + hex_value(cs[i + 2]);
+                if (is_unreserved(v)) {
+                    out = out + to_string(char_from_code(v).unwrap());
+                } else {
+                    out = out + pct(v);
+                }
+                i = i + 3;
+                continue;
+            }
+            out = out + "%25";
+        } else {
+            out = out + to_string(c);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn default_port(scheme: string) -> int {
+    if (scheme == "https") { 443 } else { 80 }
+}
+
+/// Normalizes an absolute http(s) URL. `Err` for other schemes (mailto:, javascript:…), a
+/// missing host, or what `url.parse` rejects.
+pub fn normalize(raw: string) -> Result<string, string> {
+    let u = url.parse(escape_unsafe(raw))?;
+    let scheme = u.scheme.to_lower();
+    if (scheme != "http" && scheme != "https") {
+        return Result.Err("unsupported scheme '${scheme}'");
+    }
+    var host = match (u.host) {
+        Option.Some(h) => h.to_lower(),
+        Option.None => return Result.Err("no host"),
+    };
+    if (host.ends_with(".")) {
+        host = host.substring(0, host.len() - 1);
+    }
+    if (host == "") {
+        return Result.Err("empty host");
+    }
+    let port: Option<int> = match (u.port) {
+        Option.Some(p) => if (p == default_port(scheme)) { Option.None } else { Option.Some(p) },
+        Option.None => Option.None,
+    };
+    var path = normalize_percent(url.remove_dot_segments(u.path));
+    if (path == "") {
+        path = "/";
+    }
+    let query: Option<string> = match (u.query) {
+        Option.Some(q) => if (q == "") { Option.None } else { Option.Some(normalize_percent(q)) },
+        Option.None => Option.None,
+    };
+    let n = url.Url {
+        scheme: scheme,
+        userinfo: u.userinfo,
+        host: Option.Some(host),
+        port: port,
+        path: path,
+        query: query,
+        fragment: Option.None
+    };
+    Result.Ok(url.render(n))
+}
+
+/// Resolves `href` against `base` (RFC 3986 §5.2) and normalizes the result.
+pub fn resolve(base: string, href: string) -> Result<string, string> {
+    let abs = url.resolve(base, escape_unsafe(href))?;
+    normalize(abs)
+}
+
+/// Splits a NORMALIZED URL into the parts the crawler needs.
+pub fn parts(u: string) -> Result<Parts, string> {
+    let p = url.parse(u)?;
+    let host = p.host.unwrap_or("");
+    let port = p.port.unwrap_or(default_port(p.scheme));
+    var pq = p.path;
+    if (pq == "") {
+        pq = "/";
+    }
+    if let Option.Some(q) = p.query {
+        pq = pq + "?" + q;
+    }
+    Result.Ok(Parts { scheme: p.scheme, host: host, port: port, path_query: pq })
+}
+
+/// The origin `scheme://host[:port]` of a normalized URL: the key of a host worker (one
+/// robots.txt, one rate limit, one handle domain).
+pub fn origin(u: string) -> string {
+    match (parts(u)) {
+        Result.Ok(p) => {
+            let h = if (p.host.contains(":")) { "[${p.host}]" } else { p.host };
+            if (p.port == default_port(p.scheme)) {
+                "${p.scheme}://${h}"
+            } else {
+                "${p.scheme}://${h}:${p.port}"
+            }
+        },
+        Result.Err(_) => "",
+    }
+}
+
+/// The path plus query of a normalized URL (what robots.txt rules match against).
+pub fn path_query(u: string) -> string {
+    match (parts(u)) {
+        Result.Ok(p) => p.path_query,
+        Result.Err(_) => "/",
+    }
+}
+
+/// A crude registrable domain: the last two labels of the host (no Public Suffix List, so
+/// `a.co.uk` and `b.co.uk` count as the same site); an IP address is itself.
+pub fn site_of(host: string) -> string {
+    let labels = host.split(".");
+    if (labels.len() <= 2) {
+        return host;
+    }
+    let last = labels[labels.len() - 1];
+    if (parse_int(last).is_some()) {
+        return host;
+    }
+    "${labels[labels.len() - 2]}.${last}"
+}
+
+/// Whether `candidate` is inside the crawl scope of `seed`: `"host"` = same host (any port or
+/// scheme), `"domain"` = same registrable domain (see `site_of`), `"prefix"` = starts with the
+/// seed URL, `"any"` = everything.
+pub fn in_scope(scope: string, seed: string, candidate: string) -> bool {
+    if (scope == "any") {
+        return true;
+    }
+    if (scope == "prefix") {
+        return candidate.starts_with(seed);
+    }
+    let a = match (parts(seed)) {
+        Result.Ok(p) => p.host,
+        Result.Err(_) => return false,
+    };
+    let b = match (parts(candidate)) {
+        Result.Ok(p) => p.host,
+        Result.Err(_) => return false,
+    };
+    if (scope == "domain") {
+        return site_of(a) == site_of(b);
+    }
+    a == b
+}

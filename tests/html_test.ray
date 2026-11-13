@@ -1,0 +1,75 @@
+import html;
+
+const PAGE: string = `<!DOCTYPE html>
+<html><head>
+<title> Hola &amp; adiós   mundo </title>
+<base href="/base/">
+<link rel="canonical" href="http://h/canon">
+<meta name="robots" content="NOINDEX">
+<script>var a = "<a href='/no'>"; if (a < b) {}</script>
+<style>p { color: red }</style>
+</head>
+<body>
+<!-- <a href="/commented">x</a> -->
+<h1>Título</h1><p>Uno&nbsp;dos &#233; &#xE9; &bogus; 3 < 4</p>
+<a href="one.html">one</a>
+<A HREF='two.html' rel="nofollow external">two</A>
+<a href=three.html>three</a>
+<a name="anchor">no href</a>
+<area href="/map">
+<iframe src="/frame.html"></iframe>
+<SCRIPT type="x">ignored</SCRIPT>
+</body></html>`;
+
+@test
+fn extracts_title_and_meta() {
+    let d = html.parse(PAGE);
+    assert_eq(d.title, "Hola & adiós mundo");
+    assert_eq(d.base, Option.Some("/base/"));
+    assert_eq(d.canonical, Option.Some("http://h/canon"));
+    assert(d.noindex);
+    assert(!d.nofollow);
+}
+
+@test
+fn extracts_links_in_order() {
+    let d = html.parse(PAGE);
+    let hrefs = d.links.map(fn(l: html.Link) -> string { l.href });
+    assert_eq(hrefs, ["one.html", "two.html", "three.html", "/map", "/frame.html"]);
+    assert(d.links[1].nofollow);
+    assert(!d.links[0].nofollow);
+}
+
+@test
+fn visible_text_skips_scripts_and_comments() {
+    let d = html.parse(PAGE);
+    assert(d.text.contains("Título Uno dos é é &bogus; 3 < 4"));
+    assert(!d.text.contains("var a"));
+    assert(!d.text.contains("color"));
+    assert(!d.text.contains("ignored"));
+    assert(!d.text.contains("commented"));
+}
+
+@test
+fn entities() {
+    assert_eq(
+        html.decode_entities("a&lt;b&gt;&quot;c&quot; &#8364;&euro; &amp"),
+        "a<b>\"c\" €€ &amp"
+    );
+    assert_eq(html.decode_entities("&#xZZ; &#99999999999;"), "&#xZZ; &#99999999999;");
+}
+
+@test
+fn unicode_text_is_nfc() {
+    // "e" + combining acute → "é" (NFC).
+    let d = html.parse("<p>Cafe\u{301}</p>");
+    assert_eq(d.text, "Café");
+}
+
+@test
+fn broken_markup_does_not_hang() {
+    let d = html.parse("<a href=\"x.html\"<p>unclosed <a href='y");
+    assert(d.links.len() >= 1);
+    let e = html.parse("<title>never closed");
+    assert_eq(e.title, "never closed");
+}

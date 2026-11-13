@@ -1,0 +1,234 @@
+//! robots.txt (RFC 9309): groups by user-agent, Allow/Disallow with `*` and `$`, the longest
+//! match wins (Allow on a tie), plus the non-standard `Crawl-delay` and the `Sitemap` lines.
+
+import std/regex;
+import urlnorm;
+
+/// One Allow/Disallow line, compiled to an anchored regex.
+pub struct Rule {
+    allow: bool,
+    pattern: string,
+    re: regex.Regex,
+}
+
+/// The lines under one or more consecutive `User-agent` lines.
+pub struct Group {
+    agents: [string],
+    rules: [Rule],
+    crawl_delay_ms: Option<int>,
+}
+
+pub struct Robots {
+    groups: [Group],
+    sitemaps: [string],
+    /// What happened when it was fetched: "parsed", "missing" (4xx: allow all),
+    /// "unreachable" (5xx or network: disallow all), "empty" (none asked for).
+    source: string,
+}
+
+/// The group that applies to one user-agent, merged (RFC 9309 §2.2.1: every group naming the
+/// agent is combined; `*` only when none names it).
+pub struct Policy {
+    rules: [Rule],
+    crawl_delay_ms: Option<int>,
+    matched: string,
+    disallow_all: bool,
+}
+
+/// robots.txt that allows everything (a 4xx, or no file asked for).
+pub fn allow_all(source: string) -> Robots {
+    Robots { groups: [], sitemaps: [], source: source }
+}
+
+/// RFC 9309 §2.3.1.4: an unreachable robots.txt (5xx, network) means "disallow everything".
+pub fn disallow_all() -> Robots {
+    Robots { groups: [], sitemaps: [], source: "unreachable" }
+}
+
+const META: string = ".+?()[]{}|\\^";
+
+/// Compiles a robots path pattern: `*` = any run of characters, a trailing `$` = end of path,
+/// everything else literal; anchored at the start of the path.
+pub fn compile_pattern(pattern: string) -> Result<regex.Regex, string> {
+    var re = "^";
+    let cs = pattern.chars();
+    var i = 0;
+    while (i < cs.len()) {
+        let c = cs[i];
+        if (c == '*') {
+            re = re + ".*";
+        } else if (c == '$' && i == cs.len() - 1) {
+            re = re + "$";
+        } else if (META.contains(to_string(c)) || c == '$') {
+            re = re + "\\" + to_string(c);
+        } else {
+            re = re + to_string(c);
+        }
+        i = i + 1;
+    }
+    regex.compile(re)
+}
+
+fn parse_delay(v: string) -> Option<int> {
+    if let Option.Some(n) = parse_int(v) {
+        if (n >= 0 && n <= 86400) {
+            return Option.Some(n * 1000);
+        }
+        return Option.None;
+    }
+    match (parse_float(v)) {
+        Option.Some(f) => if (f >= 0.0 && f <= 86400.0) {
+            Option.Some((f * 1000.0) as int)
+        } else {
+            Option.None
+        },
+        Option.None => Option.None,
+    }
+}
+
+/// Parses a robots.txt body. Unknown lines and malformed rules are skipped, as the RFC asks.
+pub fn parse(body: string) -> Robots {
+    var groups: [Group] = [];
+    var sitemaps: [string] = [];
+    var agents: [string] = [];
+    var rules: [Rule] = [];
+    var delay: Option<int> = Option.None;
+    var in_rules = false;
+    for raw in body.split("\n") {
+        var line = raw;
+        if let Option.Some(h) = line.index_of("#") {
+            line = line.substring(0, h);
+        }
+        line = line.trim();
+        let colon = match (line.index_of(":")) {
+            Option.Some(c) => c,
+            Option.None => continue,
+        };
+        let key = line.substring(0, colon).trim().to_lower();
+        let value = line.substring(colon + 1, line.len()).trim();
+        if (key == "user-agent") {
+            if (in_rules) {
+                groups.push(Group { agents: agents, rules: rules, crawl_delay_ms: delay });
+                agents = [];
+                rules = [];
+                delay = Option.None;
+                in_rules = false;
+            }
+            agents.push(value.to_lower());
+        } else if (key == "allow" || key == "disallow") {
+            in_rules = true;
+            if (agents.len() == 0 || value == "") {
+                continue;
+            }
+            let pat = urlnorm.normalize_percent(value);
+            if let Result.Ok(re) = compile_pattern(pat) {
+                rules.push(Rule { allow: key == "allow", pattern: pat, re: re });
+            }
+        } else if (key == "crawl-delay") {
+            in_rules = true;
+            if (agents.len() > 0) {
+                delay = parse_delay(value);
+            }
+        } else if (key == "sitemap") {
+            if (value != "") {
+                sitemaps.push(value);
+            }
+        }
+    }
+    if (agents.len() > 0) {
+        groups.push(Group { agents: agents, rules: rules, crawl_delay_ms: delay });
+    }
+    Robots { groups: groups, sitemaps: sitemaps, source: "parsed" }
+}
+
+/// The product token of a User-Agent string: `raycrawl/0.1 (+url)` → `raycrawl`.
+pub fn product_token(user_agent: string) -> string {
+    var t = user_agent.trim();
+    if let Option.Some(i) = t.index_of("/") {
+        t = t.substring(0, i);
+    }
+    if let Option.Some(i) = t.index_of(" ") {
+        t = t.substring(0, i);
+    }
+    t.to_lower()
+}
+
+/// The policy for `user_agent`: the merged groups that name its product token, else the
+/// merged `*` groups, else nothing (allow all).
+pub fn policy_for(r: Robots, user_agent: string) -> Policy {
+    if (r.source == "unreachable") {
+        return Policy { rules: [], crawl_delay_ms: Option.None, matched: "", disallow_all: true };
+    }
+    let token = product_token(user_agent);
+    var rules: [Rule] = [];
+    var delay: Option<int> = Option.None;
+    var matched = "";
+    for g in r.groups {
+        if (g.agents.contains(token)) {
+            rules = rules + g.rules;
+            if (g.crawl_delay_ms.is_some()) {
+                delay = g.crawl_delay_ms;
+            }
+            matched = token;
+        }
+    }
+    if (matched == "") {
+        for g in r.groups {
+            if (g.agents.contains("*")) {
+                rules = rules + g.rules;
+                if (g.crawl_delay_ms.is_some()) {
+                    delay = g.crawl_delay_ms;
+                }
+                matched = "*";
+            }
+        }
+    }
+    Policy { rules: rules, crawl_delay_ms: delay, matched: matched, disallow_all: false }
+}
+
+/// The length a rule counts for in the longest-match rule: its pattern in characters.
+fn weight(r: Rule) -> int {
+    r.pattern.len()
+}
+
+/// Whether `path` (path + query, percent-normalized) may be fetched. `/robots.txt` always may.
+pub fn allowed(p: Policy, path: string) -> bool {
+    if (path == "/robots.txt") {
+        return true;
+    }
+    if (p.disallow_all) {
+        return false;
+    }
+    let target = urlnorm.normalize_percent(path);
+    var best = -1;
+    var verdict = true;
+    for r in p.rules {
+        if (r.re.search(target)) {
+            let w = weight(r);
+            if (w > best || (w == best && r.allow)) {
+                best = w;
+                verdict = r.allow;
+            }
+        }
+    }
+    verdict
+}
+
+/// The rule that decided `allowed` (for `raycrawl robots`), or "" when none matched.
+pub fn deciding_rule(p: Policy, path: string) -> string {
+    let target = urlnorm.normalize_percent(path);
+    var best = -1;
+    var line = "";
+    var allow = false;
+    for r in p.rules {
+        if (r.re.search(target)) {
+            let w = weight(r);
+            if (w > best || (w == best && r.allow && !allow)) {
+                best = w;
+                allow = r.allow;
+                line = if (r.allow) { "Allow: ${r.pattern}" } else { "Disallow: ${r.pattern}" };
+            }
+        }
+    }
+    line
+}
