@@ -617,11 +617,11 @@ pub fn crawl(
                     }
                 } else {
                     if let Option.Some(slot) = hosts.get(origin) {
-                    // A retired worker: whatever reached its backlog meanwhile goes back.
-                    for job in deque.to_array(slot.backlog) {
-                        deque.push_back(frontier, job);
+                        // A retired worker: whatever reached its backlog meanwhile goes back.
+                        for job in deque.to_array(slot.backlog) {
+                            deque.push_back(frontier, job);
+                        }
                     }
-                }
                 }
                 hosts.remove(origin);
             },
@@ -634,6 +634,13 @@ pub fn crawl(
                 pages.push(page);
                 if (interrupted || timed_out) {
                     continue;
+                }
+                // A SEED that redirects to another host (www.x → x, http → https) moves the
+                // scope with it: the target becomes a root too.
+                if (page.offsite_redirect && page.depth == 0 && page.referrer == "") {
+                    if (!roots.contains(page.final_url)) {
+                        roots.push(page.final_url);
+                    }
                 }
                 let next_depth = if (page.offsite_redirect) { page.depth } else { page.depth + 1 };
                 if (next_depth > cfg.max_depth) {

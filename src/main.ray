@@ -18,8 +18,9 @@ Usage:
   raycrawl robots URL [--user-agent UA]   the robots.txt verdict for URL
   raycrawl sitemap URL [--limit N]    the URLs a sitemap (or sitemap index, .gz too) lists
   raycrawl testsite [--port N] [--mode M]  serve the local fixture site (until Ctrl-C)
-  raycrawl bench [--pages N] [--per-host N] [--fan F] [--hosts H]
-                                      crawl a generated site in-process, report pages/s
+  raycrawl bench [--pages N] [--per-host N] [--fan F] [--hosts H] [--site BASE]
+                                      crawl a generated site (in-process, or the
+                                      "raycrawl testsite" at BASE), report pages/s
   raycrawl version
 
 Crawl options:
@@ -69,6 +70,7 @@ struct Cli {
     pages: int,
     fan: int,
     hosts: int,
+    site: string,
 }
 
 fn parse_cli(argv: [string]) -> Result<Cli, string> {
@@ -83,7 +85,8 @@ fn parse_cli(argv: [string]) -> Result<Cli, string> {
         limit: 1000,
         pages: 500,
         fan: 8,
-        hosts: 1
+        hosts: 1,
+        site: ""
     };
     var i = 0;
     while (i < argv.len()) {
@@ -136,6 +139,8 @@ fn parse_cli(argv: [string]) -> Result<Cli, string> {
             c.fan = int_of(argv, i, a)?;
         } else if (a == "--hosts") {
             c.hosts = int_of(argv, i, a)?;
+        } else if (a == "--site") {
+            c.site = value_of(argv, i, a)?;
         } else if (a == "--crash-on") {
             cfg.crash_marker = value_of(argv, i, a)?;
         } else {
@@ -284,16 +289,22 @@ fn cmd_testsite(c: Cli) -> int {
     0
 }
 
-/// Crawls `/gen/1` of `hosts` in-process fixture sites (a `fan`-ary tree of `pages` nodes each)
+/// Crawls `/gen/0` of `hosts` in-process fixture sites (a `fan`-ary tree of `pages` nodes each)
 /// with no delay and no text, and reports the throughput.
 fn cmd_bench(c: Cli) -> int {
     var sites: [testsite.Site] = [];
     var seeds: [string] = [];
     var k = 0;
+    if (c.site != "") {
+        // An out-of-process fixture site (`raycrawl testsite`): the server does not share
+        // this process's scheduler.
+        seeds.push("${c.site}/gen/0?fan=${c.fan}&max=${c.pages}");
+        k = c.hosts;
+    }
     while (k < c.hosts) {
         match (testsite.start("default")) {
             Result.Ok(s) => {
-                seeds.push("${s.base}/gen/1?fan=${c.fan}&max=${c.pages}");
+                seeds.push("${s.base}/gen/0?fan=${c.fan}&max=${c.pages}");
                 sites.push(s);
             },
             Result.Err(e) => {
@@ -306,7 +317,7 @@ fn cmd_bench(c: Cli) -> int {
     let cfg = c.cfg.clone();
     cfg.delay_ms = 0;
     cfg.max_depth = 1000;
-    cfg.max_pages = c.pages * c.hosts;
+    cfg.max_pages = c.pages * seeds.len();
     cfg.text_chars = 0;
     cfg.quiet = true;
     let interrupts: Channel<int> = Channel.new();
@@ -317,12 +328,12 @@ fn cmd_bench(c: Cli) -> int {
     let ok = s.by_status.get_or(200, 0);
     let per_sec = if (ms > 0) { ok * 1000 / ms } else { 0 };
     print(
-        "bench: hosts=${c.hosts} per-host=${cfg.per_host} pages=${ok}/${c.pages * c.hosts} in ${ms} ms = ${per_sec} pages/s (workers=${worker_count()}, used ${s.by_worker.len()})"
+        "bench: hosts=${c.hosts} per-host=${cfg.per_host} pages=${ok}/${c.pages * seeds.len()} in ${ms} ms = ${per_sec} pages/s (workers=${worker_count()}, used ${s.by_worker.len()})"
     );
     for site in sites {
         testsite.stop(site);
     }
-    if (ok == c.pages * c.hosts) { 0 } else { 1 }
+    if (ok == c.pages * seeds.len()) { 0 } else { 1 }
 }
 
 fn main() -> int {

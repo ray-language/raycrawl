@@ -119,16 +119,14 @@ fn gen_page(n: int, fan: int, max: int) -> string {
     var k = 1;
     while (k <= fan) {
         let child = n * fan + k;
-        if (child <= max) {
+        if (child < max) {
             links = links
                 + "<a href=\"/gen/${child}?fan=${fan}&amp;max=${max}\">page ${child}</a>\n";
         }
         k = k + 1;
     }
-    page(
-        "Generated ${n}",
-        "<p>Node ${n} of a ${fan}-ary tree with ${max} nodes. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>\n${links}"
-    )
+    // No home link: the bench graph is exactly the tree.
+    "<!doctype html><html><head><title>Generated ${n}</title></head><body><p>Node ${n} of a ${fan}-ary tree with nodes 0..${max - 1}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>\n${links}</body></html>"
 }
 
 fn query_int(req: webserver.Request, key: string, default: int) -> int {
@@ -226,6 +224,9 @@ pub fn handle(
     if (p == "/loop/b") {
         return redirect(302, "/loop/a");
     }
+    if (p == "/hop") {
+        return redirect(302, webserver.query_params(req).get_or("to", "/"));
+    }
     if (p == "/offsite") {
         return redirect(301, "http://example.invalid/landing");
     }
@@ -273,7 +274,7 @@ pub fn handle(
         );
     }
     if (p.starts_with("/gen/")) {
-        let n = parse_int(p.substring(5, p.len())).unwrap_or(1);
+        let n = parse_int(p.substring(5, p.len())).unwrap_or(0);
         return webserver.html_response(
             200,
             gen_page(n, query_int(req, "fan", 4), query_int(req, "max", 100))

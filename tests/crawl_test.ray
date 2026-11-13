@@ -242,3 +242,20 @@ fn summary_mentions_the_essentials() {
     assert(line.contains("\"title\":\"日本語のページ\""));
     assert(line.contains("\"links\":["));
 }
+
+@test
+fn a_seed_redirecting_to_another_host_moves_the_scope() {
+    let a = site("default");
+    let b = site("default");
+    let c = fast();
+    c.max_depth = 1;
+    let r = run(["${a.base}/hop?to=${b.base}/sjis.html"], c);
+    testsite.stop(a);
+    testsite.stop(b);
+    let seed = r.pages[0];
+    assert(seed.offsite_redirect);
+    assert_eq(seed.final_url, "${b.base}/sjis.html");
+    assert_eq(find(r, "/sjis-2.html").unwrap().status, 200);
+    // Nothing else of host a: /hop is the only page fetched there.
+    assert_eq(r.pages.filter(fn(p: crawler.Page) -> bool { p.url.starts_with(a.base) }).len(), 1);
+}
