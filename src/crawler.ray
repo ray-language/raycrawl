@@ -1,0 +1,706 @@
+//! The crawl: one coordinator fiber owns the frontier (a deque), the seen-set and the per-host
+//! queues; every origin gets its own host worker started with `spawn_isolated` (a fresh handle
+//! domain: a host's sockets cannot leak into, or be touched by, another host's fibers). The
+//! host worker fetches robots.txt, then a dispatcher paces request starts (delay / Crawl-delay,
+//! circuit breaker) and hands jobs over a rendezvous channel to `per_host` fetchers spawned with
+//! `spawn_local` (same scheduler worker as their dispatcher: no cross-thread wake-ups), all
+//! inside a `scope`, so a dispatcher crash cancels its fetchers. A watcher fiber per host
+//! `try_join`s it and reports a crash as an event: the crawl goes on without that host.
+
+import std/time;
+import std/resilience;
+import std/collections/deque;
+import std/collections/set;
+import config;
+import fetch;
+import robots;
+import urlnorm;
+import encoding;
+import html;
+import sitemap;
+
+pub struct Job {
+    url: string,
+    depth: int,
+    referrer: string,
+}
+
+/// One line of the output: what happened to one URL.
+pub struct Page {
+    url: string,
+    final_url: string,
+    status: int,
+    depth: int,
+    referrer: string,
+    /// "page" (fetched), "robots" (disallowed), "breaker" (host circuit open), "lost" (its host
+    /// worker crashed), "error" (fetch or processing failed).
+    kind: string,
+    redirects: [fetch.Hop],
+    content_type: string,
+    charset: string,
+    charset_source: string,
+    replaced: int,
+    size: int,
+    truncated: bool,
+    title: string,
+    /// Followable outgoing links, resolved and normalized, in document order, no repeats.
+    links: [string],
+    nofollow_links: int,
+    noindex: bool,
+    text: string,
+    error: string,
+    attempts: int,
+    elapsed_ms: int,
+    worker: int,
+    offsite_redirect: bool,
+}
+
+pub enum Event {
+    Done(Page),
+    /// A host worker ended: its origin and the failure ("" = clean exit).
+    HostExit(string, string),
+    Interrupt(int),
+}
+
+pub enum HostMsg {
+    Fetch(Job),
+    Outcome(bool),
+}
+
+pub struct Report {
+    pages: [Page],
+    /// (origin, failure) of every host worker that crashed.
+    crashed: [(string, string)],
+    elapsed_ms: int,
+    /// URLs found but not crawled because of --max-pages.
+    over_limit: int,
+    /// URLs from sitemaps that seeded the crawl.
+    from_sitemaps: int,
+    interrupted: bool,
+    timed_out: bool,
+}
+
+struct HostSlot {
+    jobs: Channel<HostMsg>,
+    backlog: deque.Deque<Job>,
+    pending: Map<string, Job>,
+    started: bool,
+    retiring: bool,
+}
+
+fn blank(job: Job, kind: string, err: string) -> Page {
+    Page {
+        url: job.url,
+        final_url: job.url,
+        status: 0,
+        depth: job.depth,
+        referrer: job.referrer,
+        kind: kind,
+        redirects: [],
+        content_type: "",
+        charset: "",
+        charset_source: "",
+        replaced: 0,
+        size: 0,
+        truncated: false,
+        title: "",
+        links: [],
+        nofollow_links: 0,
+        noindex: false,
+        text: "",
+        error: err,
+        attempts: 0,
+        elapsed_ms: 0,
+        worker: worker_id(),
+        offsite_redirect: false
+    }
+}
+
+fn is_html(ct: string) -> bool {
+    let c = ct.to_lower();
+    c == "" || c.contains("html")
+}
+
+/// Fetches and digests one URL (runs in a fetcher fiber).
+pub fn process(job: Job, cfg: config.Config, policy: robots.Policy) -> Page {
+    let f = fetch.fetch_page(job.url, cfg, policy);
+    var p = blank(job, if (f.error == "") { "page" } else { "error" }, f.error);
+    p.final_url = f.final_url;
+    p.status = f.status;
+    p.redirects = f.redirects;
+    p.content_type = f.content_type;
+    p.size = f.body.len();
+    p.truncated = f.truncated;
+    p.attempts = f.attempts;
+    p.elapsed_ms = f.elapsed_ms;
+    p.offsite_redirect = f.offsite_redirect;
+    if (f.offsite_redirect) {
+        p.links = [f.final_url];
+        return p;
+    }
+    if (f.status < 200 || f.status >= 300 || f.body.len() == 0) {
+        return p;
+    }
+    let d = encoding.decode_body(f.body, f.content_type);
+    p.charset = d.label;
+    p.charset_source = d.source;
+    p.replaced = d.replaced;
+    if (!is_html(f.content_type)) {
+        p.text = html.clean_text(d.text).substring(0, cfg.text_chars);
+        return p;
+    }
+    let doc = html.parse(d.text);
+    p.title = doc.title;
+    p.noindex = doc.noindex;
+    p.text = doc.text.substring(0, cfg.text_chars);
+    var base = f.final_url;
+    if let Option.Some(b) = doc.base {
+        if let Result.Ok(u) = urlnorm.resolve(f.final_url, b) {
+            base = u;
+        }
+    }
+    let seen: set.Set<string> = set.new();
+    var links: [string] = [];
+    var skipped = 0;
+    for l in doc.links {
+        if (l.nofollow || doc.nofollow) {
+            skipped = skipped + 1;
+            continue;
+        }
+        if let Result.Ok(u) = urlnorm.resolve(base, l.href) {
+            if (!set.has(seen, u)) {
+                set.add(seen, u);
+                links.push(u);
+            }
+        }
+    }
+    p.links = links;
+    p.nofollow_links = skipped;
+    p
+}
+
+/// A fetcher: takes jobs from its host's dispatcher until the channel closes. A panic while
+/// digesting a page is caught (`try_call`) and becomes that page's error.
+fn fetcher(
+    work: Channel<Job>,
+    outcomes: Channel<HostMsg>,
+    events: Channel<Event>,
+    cfg: config.Config,
+    policy: robots.Policy
+) -> int {
+    var n = 0;
+    while (true) {
+        let job = match (recv(work)) {
+            Option.Some(j) => j,
+            Option.None => break,
+        };
+        let page = match (try_call(fn() -> Page { process(job, cfg, policy) })) {
+            Result.Ok(pg) => pg,
+            Result.Err(e) => blank(job, "error", "panic while processing: ${e}"),
+        };
+        let healthy = page.status != 0 && page.status < 500;
+        send(outcomes, HostMsg.Outcome(healthy));
+        send(events, Event.Done(page));
+        n = n + 1;
+    }
+    n
+}
+
+/// The gap between two request starts to this host: our delay, or the robots.txt Crawl-delay
+/// when it asks for more (capped at `max_delay_ms`).
+pub fn host_gap(cfg: config.Config, policy: robots.Policy) -> int {
+    match (policy.crawl_delay_ms) {
+        Option.Some(d) => {
+            let asked = if (d > cfg.max_delay_ms) { cfg.max_delay_ms } else { d };
+            if (asked > cfg.delay_ms) { asked } else { cfg.delay_ms }
+        },
+        Option.None => cfg.delay_ms,
+    }
+}
+
+/// One origin's worker (runs in its own handle domain).
+fn host_main(
+    origin: string,
+    jobs: Channel<HostMsg>,
+    events: Channel<Event>,
+    cfg: config.Config
+) -> int {
+    let rb = if (cfg.respect_robots) {
+        fetch.fetch_robots(origin, cfg)
+    } else {
+        robots.allow_all("ignored")
+    };
+    let policy = robots.policy_for(rb, cfg.user_agent);
+    let gap = host_gap(cfg, policy);
+    let breaker = resilience.breaker(cfg.breaker_threshold, cfg.breaker_cooldown_ms);
+    let work: Channel<Job> = Channel.bounded(0);
+    let outcomes: Channel<HostMsg> = Channel.new();
+    scope(fn() -> int {
+        var k = 0;
+        while (k < cfg.per_host) {
+            spawn_local(fn() -> int { fetcher(work, outcomes, events, cfg, policy) });
+            k = k + 1;
+        }
+        var next_start = 0;
+        var dispatched = 0;
+        while (true) {
+            let i = select([outcomes, jobs]);
+            let msg = if (i == 0) { recv(outcomes) } else { recv(jobs) };
+            match (msg) {
+                Option.None => break,
+                Option.Some(HostMsg.Outcome(ok)) => resilience.report(breaker, ok),
+                Option.Some(HostMsg.Fetch(job)) => {
+                    if (cfg.crash_marker != "" && job.url.contains(cfg.crash_marker)) {
+                        panic("injected crash on ${job.url}");
+                    }
+                    if (!robots.allowed(policy, urlnorm.path_query(job.url))) {
+                        send(
+                            events,
+                            Event.Done(
+                                blank(job, "robots", "disallowed by robots.txt (${rb.source})")
+                            )
+                        );
+                        continue;
+                    }
+                    // Outcomes that arrived while we slept count before deciding.
+                    while (true) {
+                        match (try_recv(outcomes)) {
+                            Received.Got(HostMsg.Outcome(ok)) => resilience.report(breaker, ok),
+                            _ => break,
+                        }
+                    }
+                    if (!resilience.admit(breaker)) {
+                        send(
+                            events,
+                            Event.Done(
+                                blank(
+                                    job,
+                                    "breaker",
+                                    "circuit open: ${cfg.breaker_threshold} consecutive failures on ${origin}"
+                                )
+                            )
+                        );
+                        continue;
+                    }
+                    let now = time.monotonic();
+                    if (now < next_start) {
+                        time.sleep(next_start - now);
+                    }
+                    next_start = time.monotonic() + gap;
+                    send(work, job);
+                    dispatched = dispatched + 1;
+                },
+            }
+        }
+        close(work);
+        dispatched
+    })
+}
+
+/// Starts a host worker in a fresh handle domain plus the watcher that turns its end (or
+/// crash) into an event.
+fn start_host(origin: string, jobs: Channel<HostMsg>, events: Channel<Event>, cfg: config.Config) {
+    let t = spawn_isolated(fn() -> int { host_main(origin, jobs, events, cfg) });
+    spawn(fn() -> int {
+        let failure = match (try_join(t)) {
+            Result.Ok(_) => "",
+            Result.Err(e) => e,
+        };
+        send(events, Event.HostExit(origin, failure));
+        0
+    });
+}
+
+/// Every URL a sitemap (or sitemap index, one level down, children fetched concurrently in a
+/// `scope`) lists, up to `limit`. Errors are reported per sitemap, not fatal.
+pub fn collect_sitemap(start: string, cfg: config.Config, limit: int) -> ([string], [string]) {
+    let allow = robots.policy_for(robots.allow_all("sitemap"), cfg.user_agent);
+    var c = cfg.clone();
+    c.max_bytes = sitemap.MAX_SITEMAP_BYTES;
+    var urls: [string] = [];
+    var problems: [string] = [];
+    let first = read_sitemap(start, c, allow);
+    let sm = match (first) {
+        Result.Ok(s) => s,
+        Result.Err(e) => {
+            problems.push("${start}: ${e}");
+            return (urls, problems);
+        },
+    };
+    if (!sm.is_index) {
+        for e in sm.entries {
+            if (urls.len() < limit) {
+                urls.push(e.loc);
+            }
+        }
+        return (urls, problems);
+    }
+    let children = sm.entries.map(fn(e: sitemap.Entry) -> string { e.loc });
+    let results: [(string, Result<sitemap.Sitemap, string>)] = scope(fn() -> [(string, Result<sitemap.Sitemap, string>)] {
+        var tasks: [Task<Result<sitemap.Sitemap, string>>] = [];
+        for child in children {
+            tasks.push(
+                spawn(fn() -> Result<sitemap.Sitemap, string> { read_sitemap(child, c, allow) })
+            );
+        }
+        var out: [(string, Result<sitemap.Sitemap, string>)] = [];
+        var i = 0;
+        while (i < tasks.len()) {
+            let r = match (try_join(tasks[i])) {
+                Result.Ok(v) => v,
+                Result.Err(e) => Result.Err("crashed: ${e}"),
+            };
+            out.push((children[i], r));
+            i = i + 1;
+        }
+        out
+    });
+    for (child, r) in results {
+        match (r) {
+            Result.Ok(s) => {
+                if (s.is_index) {
+                    problems.push("${child}: nested sitemap index ignored");
+                }
+                for e in s.entries {
+                    if (urls.len() < limit && !s.is_index) {
+                        urls.push(e.loc);
+                    }
+                }
+            },
+            Result.Err(e) => problems.push("${child}: ${e}"),
+        }
+    }
+    return (urls, problems);
+}
+
+fn read_sitemap(
+    u: string,
+    cfg: config.Config,
+    allow: robots.Policy
+) -> Result<sitemap.Sitemap, string> {
+    let f = fetch.fetch_page(u, cfg, allow);
+    if (f.error != "") {
+        return Result.Err(f.error);
+    }
+    if (f.status != 200) {
+        return Result.Err("HTTP ${f.status}");
+    }
+    if (f.truncated) {
+        return Result.Err("larger than ${cfg.max_bytes} bytes");
+    }
+    sitemap.parse(f.body)
+}
+
+/// The sitemaps of an origin: the robots.txt `Sitemap:` lines, else `/sitemap.xml`.
+pub fn discover_sitemaps(origin: string, cfg: config.Config) -> [string] {
+    let rb = fetch.fetch_robots(origin, cfg);
+    var found: [string] = [];
+    for s in rb.sitemaps {
+        if let Result.Ok(u) = urlnorm.resolve("${origin}/robots.txt", s) {
+            found.push(u);
+        }
+    }
+    if (found.len() == 0) {
+        found.push("${origin}/sitemap.xml");
+    }
+    found
+}
+
+fn log(cfg: config.Config, msg: string) {
+    if (!cfg.quiet) {
+        eprint(msg);
+    }
+}
+
+/// Crawls from `seeds`. Every finished page is handed to `sink` as it completes (the JSONL
+/// writer) and collected in the report. Signal numbers arriving on `interrupts` (pass
+/// `signals()`; the caller owns the channel) stop new requests: SIGINT/SIGTERM drain gracefully.
+pub fn crawl(
+    seeds: [string],
+    cfg: config.Config,
+    sink: fn(Page) -> unit,
+    interrupts: Channel<int>
+) -> Report {
+    let t0 = time.monotonic();
+    let events: Channel<Event> = Channel.new();
+    // Ctrl-C / SIGTERM arrive on `interrupts` (another type) — a forwarder makes them events.
+    spawn(fn() -> int {
+        while (true) {
+            match (recv(interrupts)) {
+                Option.Some(sig) => if (sig == 2 || sig == 15) {
+                    send(events, Event.Interrupt(sig));
+                },
+                Option.None => break,
+            }
+        }
+        0
+    });
+    let frontier: deque.Deque<Job> = deque.new();
+    let seen: set.Set<string> = set.new();
+    let hosts: Map<string, HostSlot> = Map.new();
+    let dead: Map<string, string> = Map.new();
+    var pages: [Page] = [];
+    var crashed: [(string, string)] = [];
+    var roots: [string] = [];
+    var admitted = 0;
+    var over_limit = 0;
+    var from_sitemaps = 0;
+    var interrupted = false;
+    var timed_out = false;
+    for s in seeds {
+        match (urlnorm.normalize(s)) {
+            Result.Ok(u) => {
+                roots.push(u);
+                if (!set.has(seen, u) && admitted < cfg.max_pages) {
+                    set.add(seen, u);
+                    admitted = admitted + 1;
+                    deque.push_back(frontier, Job { url: u, depth: 0, referrer: "" });
+                }
+            },
+            Result.Err(e) => log(cfg, "raycrawl: skipping seed '${s}': ${e}"),
+        }
+    }
+    if (cfg.use_sitemaps) {
+        var origins: [string] = [];
+        for r in roots {
+            let o = urlnorm.origin(r);
+            if (!origins.contains(o)) {
+                origins.push(o);
+            }
+        }
+        for o in origins {
+            for sm in discover_sitemaps(o, cfg) {
+                let (urls, problems) = collect_sitemap(sm, cfg, cfg.max_pages);
+                for pr in problems {
+                    log(cfg, "raycrawl: sitemap ${pr}");
+                }
+                for raw in urls {
+                    if let Result.Ok(u) = urlnorm.normalize(raw) {
+                        if (in_any_scope(cfg.scope, roots, u) && !set.has(seen, u)) {
+                            if (admitted < cfg.max_pages) {
+                                set.add(seen, u);
+                                admitted = admitted + 1;
+                                from_sitemaps = from_sitemaps + 1;
+                                deque.push_back(frontier, Job { url: u, depth: 0, referrer: sm });
+                            } else {
+                                over_limit = over_limit + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let tick = 200;
+    while (true) {
+        // 1. Route the frontier into per-host backlogs (starting host workers on demand).
+        while (true) {
+            let job = match (deque.pop_front(frontier)) {
+                Option.Some(j) => j,
+                Option.None => break,
+            };
+            let origin = urlnorm.origin(job.url);
+            if let Option.Some(why) = dead.get(origin) {
+                let p = blank(job, "lost", "host worker crashed earlier: ${why}");
+                sink(p);
+                pages.push(p);
+                continue;
+            }
+            match (hosts.get(origin)) {
+                Option.Some(slot) => deque.push_back(slot.backlog, job),
+                Option.None => {
+                    let slot = HostSlot {
+                        jobs: Channel.bounded(cfg.per_host * 2),
+                        backlog: deque.new(),
+                        pending: Map.new(),
+                        started: false,
+                        retiring: false
+                    };
+                    deque.push_back(slot.backlog, job);
+                    hosts.insert(origin, slot);
+                },
+            }
+        }
+        // 2. Start host workers (at most `max_hosts` at once) and feed them without blocking:
+        //    a full queue keeps the job in the backlog. An idle worker retires when another
+        //    host is waiting for a slot.
+        var active = 0;
+        var waiting = 0;
+        for (_, slot) in hosts {
+            if (slot.started) {
+                active = active + 1;
+            } else {
+                waiting = waiting + 1;
+            }
+        }
+        for (origin, slot) in hosts {
+            if (!slot.started && active < cfg.max_hosts) {
+                start_host(origin, slot.jobs, events, cfg);
+                slot.started = true;
+                active = active + 1;
+                waiting = waiting - 1;
+            }
+            if (!slot.started || slot.retiring) {
+                continue;
+            }
+            while (true) {
+                let job = match (deque.peek_front(slot.backlog)) {
+                    Option.Some(j) => j,
+                    Option.None => break,
+                };
+                if (!try_send(slot.jobs, HostMsg.Fetch(job))) {
+                    break;
+                }
+                let _ = deque.pop_front(slot.backlog);
+                slot.pending.insert(job.url, job);
+            }
+            if (waiting > 0 && slot.pending.len() == 0 && deque.len(slot.backlog) == 0) {
+                close(slot.jobs);
+                slot.retiring = true;
+            }
+        }
+        // 3. Done when nothing is queued, in flight or still shutting down.
+        var busy = false;
+        for (_, slot) in hosts {
+            if (slot.pending.len() > 0 || deque.len(slot.backlog) > 0 || slot.retiring) {
+                busy = true;
+            }
+        }
+        if (!busy) {
+            break;
+        }
+        if (cfg.max_time_ms > 0 && time.monotonic() - t0 > cfg.max_time_ms && !timed_out) {
+            timed_out = true;
+            log(cfg, "raycrawl: --max-time reached, finishing what is in flight");
+            for (_, slot) in hosts {
+                over_limit = over_limit + deque.len(slot.backlog);
+                slot.backlog = deque.new();
+            }
+            continue;
+        }
+        match (select_timeout([events], tick)) {
+            Option.None => continue,
+            Option.Some(_) => { },
+        }
+        match (recv(events)) {
+            Option.None => break,
+            Option.Some(Event.Interrupt(sig)) => {
+                if (!interrupted) {
+                    interrupted = true;
+                    log(
+                        cfg,
+                        "raycrawl: signal ${sig}: no new requests, waiting for the ones in flight"
+                    );
+                    for (_, slot) in hosts {
+                        over_limit = over_limit + deque.len(slot.backlog);
+                        slot.backlog = deque.new();
+                    }
+                    over_limit = over_limit + deque.len(frontier);
+                }
+            },
+            Option.Some(Event.HostExit(origin, failure)) => {
+                if (failure != "") {
+                    log(cfg, "raycrawl: host worker for ${origin} crashed: ${failure}");
+                    crashed.push((origin, failure));
+                    dead.insert(origin, failure);
+                    if let Option.Some(slot) = hosts.get(origin) {
+                        for (_, job) in slot.pending {
+                            let p = blank(job, "lost", "host worker crashed: ${failure}");
+                            sink(p);
+                            pages.push(p);
+                        }
+                        for job in deque.to_array(slot.backlog) {
+                            let p = blank(job, "lost", "host worker crashed: ${failure}");
+                            sink(p);
+                            pages.push(p);
+                        }
+                    }
+                } else {
+                    if let Option.Some(slot) = hosts.get(origin) {
+                    // A retired worker: whatever reached its backlog meanwhile goes back.
+                    for job in deque.to_array(slot.backlog) {
+                        deque.push_back(frontier, job);
+                    }
+                }
+                }
+                hosts.remove(origin);
+            },
+            Option.Some(Event.Done(page)) => {
+                let origin = urlnorm.origin(page.url);
+                if let Option.Some(slot) = hosts.get(origin) {
+                    slot.pending.remove(page.url);
+                }
+                sink(page);
+                pages.push(page);
+                if (interrupted || timed_out) {
+                    continue;
+                }
+                let next_depth = if (page.offsite_redirect) { page.depth } else { page.depth + 1 };
+                if (next_depth > cfg.max_depth) {
+                    continue;
+                }
+                for link in page.links {
+                    if (set.has(seen, link) || !in_any_scope(cfg.scope, roots, link)) {
+                        continue;
+                    }
+                    set.add(seen, link);
+                    if (admitted >= cfg.max_pages) {
+                        over_limit = over_limit + 1;
+                        continue;
+                    }
+                    admitted = admitted + 1;
+                    deque.push_back(
+                        frontier,
+                        Job { url: link, depth: next_depth, referrer: page.url }
+                    );
+                }
+            },
+        }
+    }
+    // Shut the host workers down and wait for each to report its exit.
+    var live = 0;
+    for (_, slot) in hosts {
+        if (slot.started && !slot.retiring) {
+            close(slot.jobs);
+            live = live + 1;
+        } else if (slot.retiring) {
+            live = live + 1;
+        }
+    }
+    while (live > 0) {
+        match (select_timeout([events], cfg.timeout_ms * (cfg.retries + 2))) {
+            Option.None => {
+                log(cfg, "raycrawl: ${live} host worker(s) did not exit in time");
+                break;
+            },
+            Option.Some(_) => match (recv(events)) {
+                Option.Some(Event.HostExit(origin, failure)) => {
+                    if (failure != "") {
+                        crashed.push((origin, failure));
+                    }
+                    live = live - 1;
+                },
+                Option.Some(_) => { },
+                Option.None => break,
+            },
+        }
+    }
+    Report {
+        pages: pages,
+        crashed: crashed,
+        elapsed_ms: time.monotonic() - t0,
+        over_limit: over_limit,
+        from_sitemaps: from_sitemaps,
+        interrupted: interrupted,
+        timed_out: timed_out
+    }
+}
+
+fn in_any_scope(scope: string, roots: [string], u: string) -> bool {
+    for r in roots {
+        if (urlnorm.in_scope(scope, r, u)) {
+            return true;
+        }
+    }
+    false
+}

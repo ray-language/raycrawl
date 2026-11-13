@@ -1,0 +1,244 @@
+//! End-to-end crawls against the in-process fixture site (127.0.0.1, port 0). No internet.
+
+import std/time;
+import config;
+import crawler;
+import fetch;
+import report;
+import testsite;
+
+fn fast() -> config.Config {
+    let c = config.defaults();
+    c.delay_ms = 0;
+    c.timeout_ms = 3000;
+    c.retries = 2;
+    c.backoff_ms = 20;
+    c.quiet = true;
+    c
+}
+
+fn run(seeds: [string], cfg: config.Config) -> crawler.Report {
+    let none: Channel<int> = Channel.new();
+    let r = crawler.crawl(seeds, cfg, fn(p: crawler.Page) { }, none);
+    close(none);
+    r
+}
+
+fn find(r: crawler.Report, suffix: string) -> Option<crawler.Page> {
+    for p in r.pages {
+        if (p.url.ends_with(suffix)) {
+            return Option.Some(p);
+        }
+    }
+    Option.None
+}
+
+fn count(r: crawler.Report, suffix: string) -> int {
+    r.pages.filter(fn(p: crawler.Page) -> bool { p.url.ends_with(suffix) }).len()
+}
+
+fn site(mode: string) -> testsite.Site {
+    testsite.start(mode).expect("fixture site")
+}
+
+@test
+fn crawls_the_fixture_site() {
+    let s = site("default");
+    let r = run(["${s.base}/"], fast());
+    testsite.stop(s);
+    // Charsets: header, meta (http-equiv and charset), BOM beating a wrong header, UTF-16.
+    assert_eq(find(r, "/latin1.html").unwrap().title, "Página en Latin-1");
+    let cp = find(r, "/cp1252.html").unwrap();
+    assert_eq(cp.title, "“Comillas” y €uros");
+    assert_eq(cp.charset_source, "meta");
+    let sj = find(r, "/sjis.html").unwrap();
+    assert_eq(sj.title, "日本語のページ");
+    assert_eq(sj.charset, "shift_jis");
+    assert(sj.text.contains("こんにちは、世界。"));
+    assert_eq(find(r, "/sjis-2.html").unwrap().title, "二ページ目");
+    let bom = find(r, "/bom.html").unwrap();
+    assert_eq(bom.charset_source, "bom");
+    assert_eq(bom.title, "Ñandú con BOM");
+    assert_eq(find(r, "/utf16.html").unwrap().title, "UTF-16 page");
+    // robots.txt: /private/ and *.pdf$ blocked, the Allow exception fetched.
+    assert_eq(find(r, "/private/secret.html").unwrap().kind, "robots");
+    assert_eq(find(r, "/doc.pdf").unwrap().kind, "robots");
+    assert_eq(find(r, "/private/open.html").unwrap().status, 200);
+    // Dedup: three spellings of /dup.html, one fetch. Nofollow, mailto and off-site skipped.
+    assert_eq(count(r, "/dup.html"), 1);
+    assert_eq(count(r, "/nofollow-target"), 0);
+    assert_eq(count(r, "/outside"), 0);
+    // Redirects: the chain is recorded, the loop is an error.
+    let chain = find(r, "/redirect/1").unwrap();
+    assert_eq(chain.status, 200);
+    assert_eq(chain.redirects.map(fn(h: fetch.Hop) -> int { h.status }), [301, 302, 307]);
+    assert(chain.final_url.ends_with("/redirect/final"));
+    assert_eq(find(r, "/loop/a").unwrap().error, "redirect loop");
+    // Retries: two 503s then 200; a 500 retried and given up; a 404 not retried.
+    let flaky = find(r, "/flaky/home").unwrap();
+    assert_eq(flaky.status, 200);
+    assert_eq(flaky.attempts, 3);
+    assert_eq(find(r, "/error500").unwrap().attempts, 3);
+    assert_eq(find(r, "/missing.html").unwrap().attempts, 1);
+    // Depth 3 from the seed.
+    assert(find(r, "/deep/3").is_some());
+    assert(find(r, "/deep/4").is_none());
+    // Non-HTML: the image head only, the text page decoded.
+    assert_eq(find(r, "/image.png").unwrap().size, 0);
+    assert_eq(find(r, "/text.txt").unwrap().text, "plain text, no links");
+    assert_eq(report.broken(r).len(), 3);
+    assert_eq(r.crashed.len(), 0);
+}
+
+@test
+fn limits_pages_bytes_and_time() {
+    let s = site("default");
+    let c = fast();
+    c.max_pages = 5;
+    let r = run(["${s.base}/"], c);
+    assert_eq(r.pages.len(), 5);
+    assert(r.over_limit > 0);
+    // A 3 MiB page cut at 64 KiB, kept and marked truncated.
+    let h = fast();
+    h.max_bytes = 64 * 1024;
+    h.max_depth = 0;
+    let big = run(["${s.base}/huge"], h);
+    let p = big.pages[0];
+    assert(p.truncated);
+    assert_eq(p.size, 64 * 1024);
+    assert_eq(p.title, "Huge");
+    // A slow page past the timeout: every attempt times out, then it is an error.
+    let t = fast();
+    t.timeout_ms = 300;
+    t.retries = 1;
+    t.max_depth = 0;
+    let t0 = time.monotonic();
+    let slow = run(["${s.base}/slow?ms=2000"], t);
+    assert(time.monotonic() - t0 < 1900);
+    assert_eq(slow.pages[0].kind, "error");
+    assert_eq(slow.pages[0].attempts, 2);
+    assert(slow.pages[0].error.contains("timeout"));
+    testsite.stop(s);
+}
+
+@test
+fn robots_variants() {
+    let missing = site("missing");
+    let r = run(["${missing.base}/"], fast());
+    assert_eq(find(r, "/private/secret.html").unwrap().status, 200);
+    testsite.stop(missing);
+    // 5xx robots.txt = disallow everything (RFC 9309).
+    let broken = site("broken");
+    let b = run(["${broken.base}/"], fast());
+    assert_eq(b.pages.len(), 1);
+    assert_eq(b.pages[0].kind, "robots");
+    testsite.stop(broken);
+    // Crawl-delay 0.2 s for raycrawl: five requests take at least four gaps.
+    let slow = site("delay");
+    let c = fast();
+    c.max_pages = 5;
+    c.per_host = 4;
+    let t0 = time.monotonic();
+    let d = run(["${slow.base}/deep/1"], c);
+    let ms = time.monotonic() - t0;
+    assert_eq(d.pages.len(), 5);
+    assert(ms >= 800);
+    testsite.stop(slow);
+}
+
+@test
+fn a_crashing_host_worker_is_reported_not_fatal() {
+    let a = site("default");
+    let b = site("default");
+    let c = fast();
+    c.crash_marker = "/crash-worker";
+    c.scope = "any";
+    let r = run(["${a.base}/crash-worker", "${a.base}/dup.html", "${b.base}/deep/1"], c);
+    testsite.stop(a);
+    testsite.stop(b);
+    assert_eq(r.crashed.len(), 1);
+    let (origin, why) = r.crashed[0];
+    assert_eq(origin, a.base);
+    assert(why.contains("injected crash"));
+    // The other host was crawled to depth 3 regardless.
+    assert(find(r, "/deep/4").is_some());
+    let lost = r.pages.filter(fn(p: crawler.Page) -> bool { p.kind == "lost" });
+    assert(lost.len() >= 1);
+}
+
+@test
+fn sitemaps_plain_gzip_and_index() {
+    let s = site("default");
+    let (urls, problems) = crawler.collect_sitemap("${s.base}/sitemap_index.xml", fast(), 100);
+    assert(urls.contains("${s.base}/sitemap-only.html"));
+    assert(urls.contains("${s.base}/from-gzip.html"));
+    assert_eq(problems.len(), 1);
+    assert(problems[0].contains("sitemap-missing.xml: HTTP 404"));
+    let c = fast();
+    c.use_sitemaps = true;
+    c.max_depth = 0;
+    let r = run(["${s.base}/"], c);
+    assert_eq(r.from_sitemaps, 4);
+    assert_eq(find(r, "/from-gzip.html").unwrap().status, 200);
+    assert_eq(find(r, "/deep/5").unwrap().status, 200);
+    testsite.stop(s);
+}
+
+@test
+fn circuit_breaker_stops_hammering_a_failing_host() {
+    let s = site("default");
+    let c = fast();
+    c.retries = 0;
+    c.per_host = 1;
+    c.breaker_threshold = 3;
+    c.breaker_cooldown_ms = 60000;
+    var seeds: [string] = [];
+    var i = 0;
+    while (i < 10) {
+        seeds.push("${s.base}/always503/${i}");
+        i = i + 1;
+    }
+    let r = run(seeds, c);
+    let opened = r.pages.filter(fn(p: crawler.Page) -> bool { p.kind == "breaker" }).len();
+    let served = r.pages.filter(fn(p: crawler.Page) -> bool { p.status == 503 }).len();
+    testsite.stop(s);
+    assert_eq(r.pages.len(), 10);
+    // The threshold is 3 failures; with one request in flight when the third one lands, one
+    // more may already have been admitted. Never more.
+    assert(served >= 3 && served <= 3 + c.per_host);
+    assert_eq(opened + served, 10);
+}
+
+@test
+fn more_hosts_than_slots() {
+    let a = site("default");
+    let b = site("default");
+    let d = site("default");
+    let c = fast();
+    c.max_hosts = 1;
+    c.scope = "any";
+    c.max_depth = 1;
+    // /sjis.html links to /sjis-2.html (whose home link is depth 2): 2 pages per host, one host
+    // at a time — a worker retires when idle so the next host gets the slot.
+    let r = run(["${a.base}/sjis.html", "${b.base}/sjis.html", "${d.base}/sjis.html"], c);
+    testsite.stop(a);
+    testsite.stop(b);
+    testsite.stop(d);
+    assert_eq(r.pages.len(), 6);
+    assert_eq(r.pages.filter(fn(p: crawler.Page) -> bool { p.status == 200 }).len(), 6);
+}
+
+@test
+fn summary_mentions_the_essentials() {
+    let s = site("default");
+    let r = run(["${s.base}/"], fast());
+    testsite.stop(s);
+    let text = report.summary(r);
+    assert(text.contains("Broken (3)"));
+    assert(text.contains("-301->"));
+    assert(text.contains("[redirect loop]"));
+    assert(text.contains("shift_jis (meta)"));
+    let line = report.page_json(find(r, "/sjis.html").unwrap(), true);
+    assert(line.contains("\"title\":\"日本語のページ\""));
+    assert(line.contains("\"links\":["));
+}

@@ -1,0 +1,260 @@
+//! One page fetch: streaming GET with a size cap and a time budget, retries with exponential
+//! backoff (std/resilience) for 5xx/429/network errors, and redirects followed by hand so the
+//! whole chain is recorded (and loops, robots and host changes are caught on the way).
+
+import std/time;
+import std/resilience;
+import std/collections/bytesbuilder;
+import net/http;
+import config;
+import robots;
+import urlnorm;
+
+pub struct Hop {
+    status: int,
+    url: string,
+}
+
+pub struct Fetched {
+    url: string,
+    final_url: string,
+    /// The last HTTP status seen (0 = no response at all).
+    status: int,
+    redirects: [Hop],
+    content_type: string,
+    body: bytes,
+    truncated: bool,
+    error: string,
+    attempts: int,
+    elapsed_ms: int,
+    /// The chain left this origin: `final_url` was NOT fetched; the crawler queues it.
+    offsite_redirect: bool,
+}
+
+/// What one HTTP exchange gave.
+pub struct Attempt {
+    status: int,
+    content_type: string,
+    location: string,
+    body: bytes,
+    truncated: bool,
+    error: string,
+}
+
+const RETRY_STATUS: [int] = [429, 500, 502, 503, 504];
+
+/// Network errors, timeouts and the "try again later" statuses are worth another attempt.
+pub fn retryable(a: Attempt) -> bool {
+    a.error != "" || RETRY_STATUS.contains(a.status)
+}
+
+/// Bodies the crawler reads (HTML, XML, text); for anything else only the head matters.
+pub fn wants_body(content_type: string) -> bool {
+    let ct = content_type.to_lower();
+    ct == ""
+        || ct.contains("html")
+        || ct.contains("xml")
+        || ct.starts_with("text/")
+        || ct.contains("gzip")
+        || ct.contains("octet-stream")
+}
+
+fn failed(e: string) -> Attempt {
+    Attempt {
+        status: 0,
+        content_type: "",
+        location: "",
+        body: bytes_of([]),
+        truncated: false,
+        error: e
+    }
+}
+
+/// One GET, never more than `cfg.timeout_ms` of silence per read nor of total time, and never
+/// more than `cfg.max_bytes` of body (the stream is closed there and the page marked truncated).
+pub fn fetch_once(target: string, cfg: config.Config) -> Attempt {
+    let budget = resilience.deadline(cfg.timeout_ms);
+    let headers: Map<string, string> = Map.new();
+    headers.insert("User-Agent", cfg.user_agent);
+    headers.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    let s = match (http.stream_with("GET", target, bytes_of([]), headers, cfg.timeout_ms)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => return failed(e),
+    };
+    let ct = s.headers.get_or("content-type", "");
+    let loc = s.headers.get_or("location", "");
+    let head = Attempt {
+        status: s.status,
+        content_type: ct,
+        location: loc,
+        body: bytes_of([]),
+        truncated: false,
+        error: ""
+    };
+    if ((s.status >= 300 && s.status < 400) || !wants_body(ct)) {
+        http.stream_close(s);
+        return head;
+    }
+    let buf = bytesbuilder.new();
+    while (true) {
+        if (resilience.expired(budget)) {
+            http.stream_close(s);
+            return Attempt {
+                status: s.status,
+                content_type: ct,
+                location: loc,
+                body: buf.build(),
+                truncated: true,
+                error: "deadline exceeded after ${cfg.timeout_ms} ms"
+            };
+        }
+        match (http.stream_read(s)) {
+            Result.Ok(Option.Some(chunk)) => {
+                buf.push(chunk);
+                if (buf.len() >= cfg.max_bytes) {
+                    http.stream_close(s);
+                    let all = buf.build();
+                    return Attempt {
+                        status: s.status,
+                        content_type: ct,
+                        location: loc,
+                        body: all.sub_bytes(0, cfg.max_bytes),
+                        truncated: true,
+                        error: ""
+                    };
+                }
+            },
+            Result.Ok(Option.None) => break,
+            Result.Err(e) => {
+                http.stream_close(s);
+                return Attempt {
+                    status: s.status,
+                    content_type: ct,
+                    location: loc,
+                    body: buf.build(),
+                    truncated: true,
+                    error: e
+                };
+            },
+        }
+    }
+    Attempt {
+        status: s.status,
+        content_type: ct,
+        location: loc,
+        body: buf.build(),
+        truncated: false,
+        error: ""
+    }
+}
+
+/// `fetch_once` under the retry policy: `cfg.retries` more tries, backoff doubling from
+/// `cfg.backoff_ms`. Returns the last attempt and how many were made.
+pub fn fetch_retrying(target: string, cfg: config.Config) -> (Attempt, int) {
+    var n = 0;
+    let p = resilience.policy(cfg.retries + 1, cfg.backoff_ms, cfg.backoff_ms * 8);
+    let r: Result<Attempt, Attempt> = resilience.retry(p, fn() -> Result<Attempt, Attempt> {
+        n = n + 1;
+        let a = fetch_once(target, cfg);
+        if (retryable(a)) { Result.Err(a) } else { Result.Ok(a) }
+    });
+    let a = match (r) {
+        Result.Ok(v) => v,
+        Result.Err(v) => v,
+    };
+    return (a, n);
+}
+
+/// Fetches `start` following same-origin redirects up to `cfg.max_redirects` hops. A redirect
+/// to another origin stops the chain (`offsite_redirect`); a loop, a hop limit, a bad Location
+/// or a target robots.txt disallows ends it with an `error`.
+pub fn fetch_page(start: string, cfg: config.Config, policy: robots.Policy) -> Fetched {
+    let t0 = time.monotonic();
+    var current = start;
+    var hops: [Hop] = [];
+    var visited: [string] = [start];
+    var attempts = 0;
+    let origin = urlnorm.origin(start);
+    while (true) {
+        let (a, n) = fetch_retrying(current, cfg);
+        attempts = attempts + n;
+        var f = Fetched {
+            url: start,
+            final_url: current,
+            status: a.status,
+            redirects: hops,
+            content_type: a.content_type,
+            body: a.body,
+            truncated: a.truncated,
+            error: a.error,
+            attempts: attempts,
+            elapsed_ms: 0,
+            offsite_redirect: false
+        };
+        if (a.error == "" && a.status >= 300 && a.status < 400 && a.location != "") {
+            hops.push(Hop { status: a.status, url: current });
+            f.redirects = hops;
+            let next = match (urlnorm.resolve(current, a.location)) {
+                Result.Ok(u) => u,
+                Result.Err(e) => {
+                    f.error = "bad Location '${a.location}': ${e}";
+                    f.elapsed_ms = time.monotonic() - t0;
+                    return f;
+                },
+            };
+            f.final_url = next;
+            if (visited.contains(next)) {
+                f.error = "redirect loop";
+            } else if (hops.len() > cfg.max_redirects) {
+                f.error = "too many redirects (> ${cfg.max_redirects})";
+            } else if (urlnorm.origin(next) != origin) {
+                f.offsite_redirect = true;
+            } else if (!robots.allowed(policy, urlnorm.path_query(next))) {
+                f.error = "redirect target disallowed by robots.txt";
+            } else {
+                visited.push(next);
+                current = next;
+                continue;
+            }
+        }
+        f.elapsed_ms = time.monotonic() - t0;
+        return f;
+    }
+}
+
+/// robots.txt of an origin, with the RFC 9309 status rules: 2xx parsed, 4xx = allow all,
+/// 5xx or unreachable = disallow all. Redirects are followed (up to 5).
+pub fn fetch_robots(origin: string, cfg: config.Config) -> robots.Robots {
+    // Config is a struct (reference semantics): change a copy, not the caller's.
+    let c = cfg.clone();
+    c.max_bytes = 512 * 1024;
+    c.max_redirects = 5;
+    let f = fetch_page(
+        "${origin}/robots.txt",
+        c,
+        robots.policy_for(robots.allow_all("bootstrap"), cfg.user_agent)
+    );
+    if (f.offsite_redirect) {
+        // RFC 9309 §2.3.1.2 allows following it; one extra hop off-site is enough here.
+        let g = fetch_page(
+            f.final_url,
+            c,
+            robots.policy_for(robots.allow_all("bootstrap"), cfg.user_agent)
+        );
+        return robots_from(g);
+    }
+    robots_from(f)
+}
+
+fn robots_from(f: Fetched) -> robots.Robots {
+    if (f.error != "" && f.status == 0) {
+        return robots.disallow_all();
+    }
+    if (f.status >= 200 && f.status < 300) {
+        return robots.parse(from_utf8(f.body).unwrap_or(""));
+    }
+    if (f.status >= 400 && f.status < 500) {
+        return robots.allow_all("missing");
+    }
+    robots.disallow_all()
+}

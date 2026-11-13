@@ -1,0 +1,363 @@
+//! raycrawl — a polite web crawler.
+
+import std/fs;
+import std/time;
+import config;
+import crawler;
+import fetch;
+import report;
+import robots;
+import sitemap;
+import testsite;
+import urlnorm;
+
+const USAGE: string = `raycrawl — a polite web crawler
+
+Usage:
+  raycrawl crawl URL... [options]     crawl from the seeds, JSONL out, summary on stderr
+  raycrawl robots URL [--user-agent UA]   the robots.txt verdict for URL
+  raycrawl sitemap URL [--limit N]    the URLs a sitemap (or sitemap index, .gz too) lists
+  raycrawl testsite [--port N] [--mode M]  serve the local fixture site (until Ctrl-C)
+  raycrawl bench [--pages N] [--per-host N] [--fan F] [--hosts H]
+                                      crawl a generated site in-process, report pages/s
+  raycrawl version
+
+Crawl options:
+  --depth N         link depth from the seeds (default 3)
+  --max-pages N     URLs to admit at most (default 500)
+  --out FILE        JSONL output, "-" = stdout (default pages.jsonl)
+  --report FILE     write the summary there too
+  --per-host N      concurrent requests per host (default 2)
+  --max-hosts N     hosts crawled at once (default 8)
+  --delay MS        minimum gap between requests to one host (default 250)
+  --timeout MS      budget of one attempt (default 10000)
+  --retries N       retries for 5xx/429/timeouts (default 2)
+  --max-bytes N     body cap per page (default 2097152)
+  --scope S         host | domain | prefix | any (default host)
+  --sitemaps        also seed from the sitemaps (robots.txt Sitemap: or /sitemap.xml)
+  --no-robots       ignore robots.txt (only for your own sites)
+  --user-agent UA   (default raycrawl/VERSION (+URL))
+  --text N          characters of visible text per page in the JSONL (default 300)
+  --links           include every outgoing link in the JSONL
+  --max-time MS     stop admitting work after this long
+  --quiet           no progress messages
+`;
+
+fn value_of(argv: [string], i: int, flag: string) -> Result<string, string> {
+    if (i + 1 >= argv.len()) {
+        return Result.Err("${flag} needs a value");
+    }
+    Result.Ok(argv[i + 1])
+}
+
+fn int_of(argv: [string], i: int, flag: string) -> Result<int, string> {
+    let v = value_of(argv, i, flag)?;
+    match (parse_int(v)) {
+        Option.Some(n) if (n >= 0) => Result.Ok(n),
+        _ => Result.Err("${flag} expects a non-negative integer, got '${v}'"),
+    }
+}
+
+struct Cli {
+    cfg: config.Config,
+    positional: [string],
+    out: string,
+    report_path: string,
+    port: int,
+    mode: string,
+    limit: int,
+    pages: int,
+    fan: int,
+    hosts: int,
+}
+
+fn parse_cli(argv: [string]) -> Result<Cli, string> {
+    let cfg = config.defaults();
+    var c = Cli {
+        cfg: cfg,
+        positional: [],
+        out: "pages.jsonl",
+        report_path: "",
+        port: 0,
+        mode: "default",
+        limit: 1000,
+        pages: 500,
+        fan: 8,
+        hosts: 1
+    };
+    var i = 0;
+    while (i < argv.len()) {
+        let a = argv[i];
+        var used = 2;
+        if (a == "--depth") {
+            cfg.max_depth = int_of(argv, i, a)?;
+        } else if (a == "--max-pages") {
+            cfg.max_pages = int_of(argv, i, a)?;
+        } else if (a == "--out") {
+            c.out = value_of(argv, i, a)?;
+        } else if (a == "--report") {
+            c.report_path = value_of(argv, i, a)?;
+        } else if (a == "--per-host") {
+            cfg.per_host = int_of(argv, i, a)?;
+            if (cfg.per_host < 1) {
+                return Result.Err("--per-host must be at least 1");
+            }
+        } else if (a == "--max-hosts") {
+            cfg.max_hosts = int_of(argv, i, a)?;
+        } else if (a == "--delay") {
+            cfg.delay_ms = int_of(argv, i, a)?;
+        } else if (a == "--timeout") {
+            cfg.timeout_ms = int_of(argv, i, a)?;
+        } else if (a == "--retries") {
+            cfg.retries = int_of(argv, i, a)?;
+        } else if (a == "--max-bytes") {
+            cfg.max_bytes = int_of(argv, i, a)?;
+        } else if (a == "--scope") {
+            let s = value_of(argv, i, a)?;
+            if (!["host", "domain", "prefix", "any"].contains(s)) {
+                return Result.Err("--scope must be host, domain, prefix or any");
+            }
+            cfg.scope = s;
+        } else if (a == "--user-agent") {
+            cfg.user_agent = value_of(argv, i, a)?;
+        } else if (a == "--text") {
+            cfg.text_chars = int_of(argv, i, a)?;
+        } else if (a == "--max-time") {
+            cfg.max_time_ms = int_of(argv, i, a)?;
+        } else if (a == "--port") {
+            c.port = int_of(argv, i, a)?;
+        } else if (a == "--mode") {
+            c.mode = value_of(argv, i, a)?;
+        } else if (a == "--limit") {
+            c.limit = int_of(argv, i, a)?;
+        } else if (a == "--pages") {
+            c.pages = int_of(argv, i, a)?;
+        } else if (a == "--fan") {
+            c.fan = int_of(argv, i, a)?;
+        } else if (a == "--hosts") {
+            c.hosts = int_of(argv, i, a)?;
+        } else if (a == "--crash-on") {
+            cfg.crash_marker = value_of(argv, i, a)?;
+        } else {
+            used = 1;
+            if (a == "--sitemaps") {
+                cfg.use_sitemaps = true;
+            } else if (a == "--no-robots") {
+                cfg.respect_robots = false;
+            } else if (a == "--links") {
+                cfg.emit_links = true;
+            } else if (a == "--quiet") {
+                cfg.quiet = true;
+            } else if (a.starts_with("--")) {
+                return Result.Err("unknown option ${a}");
+            } else {
+                c.positional.push(a);
+            }
+        }
+        i = i + used;
+    }
+    Result.Ok(c)
+}
+
+fn cmd_crawl(c: Cli) -> int {
+    if (c.positional.len() == 0) {
+        eprint("raycrawl crawl: give at least one URL");
+        return 2;
+    }
+    var h = -1;
+    if (c.out != "-") {
+        h = match (fs.open(c.out, "w")) {
+            Result.Ok(x) => x,
+            Result.Err(e) => {
+                eprint("raycrawl: cannot write ${c.out}: ${e}");
+                return 1;
+            },
+        };
+    }
+    let emit = c.cfg.emit_links;
+    let quiet = c.cfg.quiet;
+    var count = 0;
+    let r = crawler.crawl(c.positional, c.cfg, fn(p: crawler.Page) {
+        let line = report.page_json(p, emit);
+        if (h < 0) {
+            print(line);
+        } else {
+            let _ = fs.write(h, line + "\n");
+        }
+        count = count + 1;
+        if (!quiet && count % 50 == 0) {
+            eprint("raycrawl: ${count} URLs done");
+        }
+    }, signals());
+    if (h >= 0) {
+        close(h);
+    }
+    let text = report.summary(r);
+    eprint(text);
+    if (c.report_path != "") {
+        if let Result.Err(e) = fs.write_file(c.report_path, text) {
+            eprint("raycrawl: cannot write ${c.report_path}: ${e}");
+        }
+    }
+    if (r.crashed.len() > 0) { 3 } else { 0 }
+}
+
+fn cmd_robots(c: Cli) -> int {
+    if (c.positional.len() != 1) {
+        eprint("raycrawl robots: give one URL");
+        return 2;
+    }
+    let u = match (urlnorm.normalize(c.positional[0])) {
+        Result.Ok(v) => v,
+        Result.Err(e) => {
+            eprint("raycrawl: ${e}");
+            return 2;
+        },
+    };
+    let origin = urlnorm.origin(u);
+    let rb = fetch.fetch_robots(origin, c.cfg);
+    let p = robots.policy_for(rb, c.cfg.user_agent);
+    print("robots.txt: ${origin}/robots.txt (${rb.source}, ${rb.groups.len()} group(s))");
+    let token = robots.product_token(c.cfg.user_agent);
+    let group = if (p.matched == "") {
+        "none (no rules apply)"
+    } else {
+        "User-agent: ${p.matched}"
+    };
+    print("agent: ${token} → ${group}, ${p.rules.len()} rule(s)");
+    match (p.crawl_delay_ms) {
+        Option.Some(d) => print("crawl-delay: ${d} ms"),
+        Option.None => print("crawl-delay: none"),
+    }
+    for s in rb.sitemaps {
+        print("sitemap: ${s}");
+    }
+    let path = urlnorm.path_query(u);
+    let ok = robots.allowed(p, path);
+    let rule = robots.deciding_rule(p, path);
+    let why = if (p.disallow_all) {
+        "robots.txt unreachable: everything is disallowed"
+    } else if (rule == "") {
+        "no rule matches"
+    } else {
+        rule
+    };
+    print("${if (ok) { "ALLOWED" } else { "DISALLOWED" }} ${path}  (${why})");
+    if (ok) { 0 } else { 1 }
+}
+
+fn cmd_sitemap(c: Cli) -> int {
+    if (c.positional.len() != 1) {
+        eprint("raycrawl sitemap: give one URL");
+        return 2;
+    }
+    let (urls, problems) = crawler.collect_sitemap(c.positional[0], c.cfg, c.limit);
+    for u in urls {
+        print(u);
+    }
+    for p in problems {
+        eprint("raycrawl: ${p}");
+    }
+    eprint("${urls.len()} URL(s)");
+    if (urls.len() == 0 && problems.len() > 0) { 1 } else { 0 }
+}
+
+fn cmd_testsite(c: Cli) -> int {
+    let site = match (testsite.start_on("127.0.0.1", c.port, c.mode)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => {
+            eprint("raycrawl testsite: ${e}");
+            return 1;
+        },
+    };
+    print(site.base);
+    let sig = signals();
+    while (true) {
+        match (recv(sig)) {
+            Option.Some(s) => if (s == 2 || s == 15) {
+                break;
+            },
+            Option.None => break,
+        }
+    }
+    testsite.stop(site);
+    0
+}
+
+/// Crawls `/gen/1` of `hosts` in-process fixture sites (a `fan`-ary tree of `pages` nodes each)
+/// with no delay and no text, and reports the throughput.
+fn cmd_bench(c: Cli) -> int {
+    var sites: [testsite.Site] = [];
+    var seeds: [string] = [];
+    var k = 0;
+    while (k < c.hosts) {
+        match (testsite.start("default")) {
+            Result.Ok(s) => {
+                seeds.push("${s.base}/gen/1?fan=${c.fan}&max=${c.pages}");
+                sites.push(s);
+            },
+            Result.Err(e) => {
+                eprint("raycrawl bench: ${e}");
+                return 1;
+            },
+        }
+        k = k + 1;
+    }
+    let cfg = c.cfg.clone();
+    cfg.delay_ms = 0;
+    cfg.max_depth = 1000;
+    cfg.max_pages = c.pages * c.hosts;
+    cfg.text_chars = 0;
+    cfg.quiet = true;
+    let interrupts: Channel<int> = Channel.new();
+    let t0 = time.monotonic();
+    let r = crawler.crawl(seeds, cfg, fn(p: crawler.Page) { }, interrupts);
+    let ms = time.monotonic() - t0;
+    let s = report.stats(r);
+    let ok = s.by_status.get_or(200, 0);
+    let per_sec = if (ms > 0) { ok * 1000 / ms } else { 0 };
+    print(
+        "bench: hosts=${c.hosts} per-host=${cfg.per_host} pages=${ok}/${c.pages * c.hosts} in ${ms} ms = ${per_sec} pages/s (workers=${worker_count()}, used ${s.by_worker.len()})"
+    );
+    for site in sites {
+        testsite.stop(site);
+    }
+    if (ok == c.pages * c.hosts) { 0 } else { 1 }
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 0 || argv[0] == "help" || argv[0] == "--help" || argv[0] == "-h") {
+        print(USAGE);
+        return if (argv.len() == 0) { 2 } else { 0 };
+    }
+    if (argv[0] == "version" || argv[0] == "--version") {
+        print("raycrawl ${config.VERSION}");
+        return 0;
+    }
+    let c = match (parse_cli(argv.slice(1, argv.len()))) {
+        Result.Ok(v) => v,
+        Result.Err(e) => {
+            eprint("raycrawl: ${e}");
+            return 2;
+        },
+    };
+    let cmd = argv[0];
+    if (cmd == "crawl") {
+        return cmd_crawl(c);
+    }
+    if (cmd == "robots") {
+        return cmd_robots(c);
+    }
+    if (cmd == "sitemap") {
+        return cmd_sitemap(c);
+    }
+    if (cmd == "testsite") {
+        return cmd_testsite(c);
+    }
+    if (cmd == "bench") {
+        return cmd_bench(c);
+    }
+    eprint("raycrawl: unknown command '${cmd}' (try --help)");
+    2
+}

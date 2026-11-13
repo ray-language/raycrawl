@@ -1,0 +1,348 @@
+//! The local fixture site the tests and the benchmark crawl: no test touches the internet.
+//! Pages in UTF-8, ISO-8859-1, windows-1252, Shift_JIS and UTF-16; robots.txt variants;
+//! sitemaps (plain, gzipped, index); redirect chains and loops; slow, flaky, failing and huge
+//! endpoints; and a generated link graph for throughput runs. Always on 127.0.0.1, port 0.
+
+import std/net;
+import std/time;
+import std/charset;
+import std/deflate;
+import net/webserver;
+
+pub struct Site {
+    port: int,
+    base: string,
+    stop: Channel<int>,
+    task: Task<int>,
+}
+
+/// Hit counters live in one actor: handlers run in per-connection fibers with their own heaps.
+enum Counter {
+    Hit(string, Channel<int>),
+}
+
+fn counter_actor(inbox: Channel<Counter>) -> int {
+    let hits: Map<string, int> = Map.new();
+    while (true) {
+        match (recv(inbox)) {
+            Option.Some(Counter.Hit(key, reply)) => {
+                let n = hits.get_or(key, 0) + 1;
+                hits.insert(key, n);
+                send(reply, n);
+            },
+            Option.None => break,
+        }
+    }
+    0
+}
+
+fn hit(counter: Channel<Counter>, key: string) -> int {
+    let reply: Channel<int> = Channel.bounded(1);
+    send(counter, Counter.Hit(key, reply));
+    recv(reply).unwrap_or(0)
+}
+
+const ROBOTS_DEFAULT: string = `# raycrawl fixture
+User-agent: *
+Disallow: /private/
+Allow: /private/open.html
+Disallow: /*.pdf$
+
+User-agent: badbot
+Disallow: /
+
+Sitemap: /sitemap_index.xml
+`;
+
+const ROBOTS_DELAY: string = `User-agent: raycrawl
+Crawl-delay: 0.2
+Disallow: /private/
+`;
+
+const INDEX: string = `<!doctype html>
+<html><head><meta charset="utf-8"><title>Fixture home</title></head>
+<body>
+<h1>Raycrawl fixture</h1>
+<ul>
+<li><a href="/latin1.html">ISO-8859-1</a>
+<li><a href="cp1252.html">windows-1252</a>
+<li><a href="./sjis.html">Shift_JIS</a>
+<li><a href="/bom.html">BOM</a>
+<li><a href="/utf16.html">UTF-16</a>
+<li><a href="/redirect/1">redirect chain</a>
+<li><a href="/loop/a">redirect loop</a>
+<li><a href="/flaky/home">flaky</a>
+<li><a href="/missing.html">broken</a>
+<li><a href="/error500">server error</a>
+<li><a href="/private/secret.html">private</a>
+<li><a href="/private/open.html">private but allowed</a>
+<li><a href="/doc.pdf">pdf</a>
+<li><a href="/dup.html">dup</a> <a href="/a/../dup.html#x">dup again</a> <a href="HTTP://127.0.0.1:{{PORT}}/dup.html">dup absolute</a>
+<li><a href="/nofollow-target" rel="nofollow">nofollow</a>
+<li><a href="http://example.invalid/outside">outside</a>
+<li><a href="mailto:someone@example.invalid">mail</a>
+<li><a href="/image.png">image</a>
+<li><a href="/text.txt">text</a>
+<li><a href="/deep/1">deep</a>
+</ul></body></html>`;
+
+fn page(title: string, body: string) -> string {
+    "<!doctype html><html><head><title>${title}</title></head><body>${body}<p><a href=\"/\">home</a></p></body></html>"
+}
+
+fn html_bytes(status: int, content_type: string, body: bytes) -> webserver.Response {
+    let r = webserver.bytes_response(status, body);
+    r.headers.insert("Content-Type", content_type);
+    r
+}
+
+fn encoded(text: string, label: string) -> bytes {
+    charset.encode(text, label).unwrap_or(text.to_bytes())
+}
+
+fn redirect(status: int, to: string) -> webserver.Response {
+    let r = webserver.text(status, "moved");
+    r.headers.insert("Location", to);
+    r
+}
+
+fn sitemap_xml(host: string, paths: [string]) -> string {
+    var items = "";
+    for p in paths {
+        items = items + "<url><loc>http://${host}${p}</loc><lastmod>2026-11-01</lastmod></url>\n";
+    }
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n${items}</urlset>\n"
+}
+
+fn gen_page(n: int, fan: int, max: int) -> string {
+    var links = "";
+    var k = 1;
+    while (k <= fan) {
+        let child = n * fan + k;
+        if (child <= max) {
+            links = links
+                + "<a href=\"/gen/${child}?fan=${fan}&amp;max=${max}\">page ${child}</a>\n";
+        }
+        k = k + 1;
+    }
+    page(
+        "Generated ${n}",
+        "<p>Node ${n} of a ${fan}-ary tree with ${max} nodes. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>\n${links}"
+    )
+}
+
+fn query_int(req: webserver.Request, key: string, default: int) -> int {
+    match (webserver.query_params(req).get(key)) {
+        Option.Some(v) => parse_int(v).unwrap_or(default),
+        Option.None => default,
+    }
+}
+
+/// The site's router. `mode` picks the robots.txt variant: "default", "delay" (Crawl-delay
+/// 0.2 s), "missing" (404), "broken" (503).
+pub fn handle(
+    req: webserver.Request,
+    mode: string,
+    counter: Channel<Counter>
+) -> webserver.Response {
+    let host = req.headers.get_or("host", "127.0.0.1");
+    let p = req.path;
+    if (p == "/robots.txt") {
+        if (mode == "missing") {
+            return webserver.text(404, "no robots here");
+        }
+        if (mode == "broken") {
+            return webserver.text(503, "try later");
+        }
+        let body = if (mode == "delay") { ROBOTS_DELAY } else { ROBOTS_DEFAULT };
+        return webserver.text(200, body);
+    }
+    if (p == "/") {
+        let port = host.split(":").pop().unwrap_or("80");
+        return webserver.html_response(200, INDEX.replace("{{PORT}}", port));
+    }
+    if (p == "/latin1.html") {
+        let body = encoded(
+            page("Página en Latin-1", "<p>Café con leche, ñandú y pingüino.</p>"),
+            "iso-8859-1"
+        );
+        return html_bytes(200, "text/html; charset=ISO-8859-1", body);
+    }
+    if (p == "/cp1252.html") {
+        let body = encoded(
+            "<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1252\"><title>“Comillas” y €uros</title></head><body><p>Precio: 5 € — oferta…</p></body></html>",
+            "windows-1252"
+        );
+        return html_bytes(200, "text/html", body);
+    }
+    if (p == "/sjis.html") {
+        let body = encoded(
+            "<html><head><meta charset=\"Shift_JIS\"><title>日本語のページ</title></head><body><p>こんにちは、世界。<a href=\"/sjis-2.html\">次へ</a></p></body></html>",
+            "shift_jis"
+        );
+        return html_bytes(200, "text/html", body);
+    }
+    if (p == "/sjis-2.html") {
+        return html_bytes(
+            200,
+            "text/html; charset=Shift_JIS",
+            encoded(page("二ページ目", "<p>終わり</p>"), "shift_jis")
+        );
+    }
+    if (p == "/bom.html") {
+        // The BOM wins over a WRONG header charset.
+        let body = bytes_concat(
+            [
+                bytes_of([0xEF, 0xBB, 0xBF]),
+                page("Ñandú con BOM", "<p>UTF-8 de verdad</p>").to_bytes()
+            ]
+        );
+        return html_bytes(200, "text/html; charset=iso-8859-1", body);
+    }
+    if (p == "/utf16.html") {
+        var units: [int] = [0xFF, 0xFE];
+        for b in page("UTF-16 page", "<p>dieciséis</p>").chars() {
+            let c = char_code(b);
+            units.push(c % 256);
+            units.push(c / 256);
+        }
+        return html_bytes(200, "text/html", bytes_of(units));
+    }
+    if (p == "/redirect/1") {
+        return redirect(301, "/redirect/2");
+    }
+    if (p == "/redirect/2") {
+        return redirect(302, "http://${host}/redirect/3");
+    }
+    if (p == "/redirect/3") {
+        return redirect(307, "final");
+    }
+    if (p == "/redirect/final") {
+        return webserver.html_response(200, page("Redirect target", "<p>end of chain</p>"));
+    }
+    if (p == "/loop/a") {
+        return redirect(302, "/loop/b");
+    }
+    if (p == "/loop/b") {
+        return redirect(302, "/loop/a");
+    }
+    if (p == "/offsite") {
+        return redirect(301, "http://example.invalid/landing");
+    }
+    if (p.starts_with("/flaky/")) {
+        // Two 503s per path, then 200: a crawler with retries >= 2 sees the page.
+        let n = hit(counter, p);
+        if (n <= 2) {
+            return webserver.text(503, "flaky ${n}");
+        }
+        return webserver.html_response(
+            200,
+            page("Flaky ${p} after ${n} hits", "<p>stable now</p>")
+        );
+    }
+    if (p == "/hits") {
+        return webserver.text(200, to_string(hit(counter, req.query) - 1));
+    }
+    if (p.starts_with("/always503")) {
+        hit(counter, "always503");
+        return webserver.text(503, "down");
+    }
+    if (p == "/error500") {
+        return webserver.text(500, "boom");
+    }
+    if (p == "/slow") {
+        time.sleep(query_int(req, "ms", 1000));
+        return webserver.html_response(200, page("Slow", "<p>finally</p>"));
+    }
+    if (p == "/huge") {
+        let chunk = "<p>" + "x".repeat(1020) + "</p>\n";
+        let size = query_int(req, "kb", 3072);
+        return webserver.html_response(200, page("Huge", chunk.repeat(size)));
+    }
+    if (p == "/image.png") {
+        return html_bytes(200, "image/png", bytes_of([0x89, 0x50, 0x4E, 0x47, 0, 0, 0, 0]));
+    }
+    if (p == "/text.txt") {
+        return html_bytes(200, "text/plain; charset=utf-8", "plain text, no links".to_bytes());
+    }
+    if (p.starts_with("/deep/")) {
+        let n = parse_int(p.substring(6, p.len())).unwrap_or(0);
+        return webserver.html_response(
+            200,
+            page("Deep ${n}", "<a href=\"/deep/${n + 1}\">next</a>")
+        );
+    }
+    if (p.starts_with("/gen/")) {
+        let n = parse_int(p.substring(5, p.len())).unwrap_or(1);
+        return webserver.html_response(
+            200,
+            gen_page(n, query_int(req, "fan", 4), query_int(req, "max", 100))
+        );
+    }
+    if (p == "/sitemap.xml") {
+        let r = webserver.text(200, sitemap_xml(host, ["/", "/latin1.html", "/sitemap-only.html"]));
+        r.headers.insert("Content-Type", "application/xml");
+        return r;
+    }
+    if (p == "/sitemap_index.xml") {
+        let body = "<?xml version=\"1.0\"?>\n<sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><sitemap><loc>http://${host}/sitemap.xml</loc></sitemap><sitemap><loc>http://${host}/sitemap-b.xml.gz</loc></sitemap><sitemap><loc>http://${host}/sitemap-missing.xml</loc></sitemap></sitemapindex>";
+        let r = webserver.text(200, body);
+        r.headers.insert("Content-Type", "application/xml");
+        return r;
+    }
+    if (p == "/sitemap-b.xml.gz") {
+        let xml = sitemap_xml(host, ["/from-gzip.html", "/deep/5"]);
+        return html_bytes(200, "application/gzip", deflate.gzip_compress(xml.to_bytes()));
+    }
+    if (p == "/sitemap-only.html"
+        || p == "/from-gzip.html"
+        || p == "/dup.html"
+        || p == "/private/open.html"
+        || p == "/nofollow-target"
+        || p == "/crash-worker") {
+        return webserver.html_response(200, page("Page ${p}", "<p>a leaf</p>"));
+    }
+    if (p == "/private/secret.html" || p == "/doc.pdf") {
+        return webserver.html_response(200, page("Should never be fetched", ""));
+    }
+    webserver.html_response(404, page("Not found", "<p>${p} does not exist</p>"))
+}
+
+/// Starts the site on 127.0.0.1 and an OS-chosen port. Stop it with `stop(site)`.
+pub fn start(mode: string) -> Result<Site, string> {
+    start_on("127.0.0.1", 0, mode)
+}
+
+/// Starts the site on `host:port` (port 0 = OS-chosen).
+pub fn start_on(host: string, port: int, mode: string) -> Result<Site, string> {
+    let l = net.tcp_listen(host, port)?;
+    let actual = net.local_port(l);
+    let stop_ch: Channel<int> = Channel.new();
+    let counter: Channel<Counter> = Channel.new();
+    spawn(fn() -> int { counter_actor(counter) });
+    let task = spawn(fn() -> int {
+        let o = webserver.options().quiet().with_stop(stop_ch);
+        let r = webserver.serve_options_on(
+            l,
+            o,
+            fn() -> fn(webserver.Request) -> webserver.Response {
+                fn(req: webserver.Request) -> webserver.Response { handle(req, mode, counter) }
+            }
+        );
+        close(counter);
+        match (r) {
+            Result.Ok(_) => 0,
+            Result.Err(e) => {
+                eprint("testsite: ${e}");
+                1
+            },
+        }
+    });
+    Result.Ok(Site { port: actual, base: "http://${host}:${actual}", stop: stop_ch, task: task })
+}
+
+/// Stops the site and waits for its server fiber.
+pub fn stop(site: Site) {
+    send(site.stop, 1);
+    let _ = try_join(site.task);
+}

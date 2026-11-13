@@ -1,0 +1,189 @@
+//! Output: one JSON object per page (JSONL) and the end-of-crawl summary.
+
+import std/json;
+import std/text;
+import crawler;
+import fetch;
+
+fn hop_json(h: fetch.Hop) -> json.Obj {
+    json.obj().field("status", h.status).field("url", h.url)
+}
+
+/// One JSONL line (no trailing newline).
+pub fn page_json(p: crawler.Page, with_links: bool) -> string {
+    var hops = json.arr();
+    for h in p.redirects {
+        hops = hops.item(hop_json(h));
+    }
+    var o = json.obj()
+        .field("url", p.url)
+        .field("final_url", p.final_url)
+        .field("status", p.status)
+        .field("kind", p.kind)
+        .field("depth", p.depth)
+        .field("referrer", p.referrer)
+        .field("redirects", hops)
+        .field("content_type", p.content_type)
+        .field("charset", p.charset)
+        .field("charset_source", p.charset_source)
+        .field("size", p.size)
+        .field("truncated", p.truncated)
+        .field("title", p.title)
+        .field("link_count", p.links.len())
+        .field("noindex", p.noindex)
+        .field("text", p.text)
+        .field("error", p.error)
+        .field("attempts", p.attempts)
+        .field("elapsed_ms", p.elapsed_ms)
+        .field("worker", p.worker);
+    if (p.replaced > 0) {
+        o = o.field("replaced_chars", p.replaced);
+    }
+    if (with_links) {
+        o = o.field("links", p.links);
+    }
+    o.render()
+}
+
+pub struct Stats {
+    total: int,
+    fetched: int,
+    by_status: Map<int, int>,
+    by_kind: Map<string, int>,
+    by_worker: Map<int, int>,
+    by_charset: Map<string, int>,
+    bytes_total: int,
+    retried: int,
+    truncated: int,
+}
+
+pub fn stats(r: crawler.Report) -> Stats {
+    let s = Stats {
+        total: 0,
+        fetched: 0,
+        by_status: Map.new(),
+        by_kind: Map.new(),
+        by_worker: Map.new(),
+        by_charset: Map.new(),
+        bytes_total: 0,
+        retried: 0,
+        truncated: 0
+    };
+    for p in r.pages {
+        s.total = s.total + 1;
+        s.by_kind.insert(p.kind, s.by_kind.get_or(p.kind, 0) + 1);
+        if (p.status > 0) {
+            s.fetched = s.fetched + 1;
+            s.by_status.insert(p.status, s.by_status.get_or(p.status, 0) + 1);
+            s.by_worker.insert(p.worker, s.by_worker.get_or(p.worker, 0) + 1);
+        }
+        if (p.charset != "") {
+            let key = "${p.charset} (${p.charset_source})";
+            s.by_charset.insert(key, s.by_charset.get_or(key, 0) + 1);
+        }
+        s.bytes_total = s.bytes_total + p.size;
+        if (p.attempts > 1 + p.redirects.len()) {
+            s.retried = s.retried + 1;
+        }
+        if (p.truncated) {
+            s.truncated = s.truncated + 1;
+        }
+    }
+    s
+}
+
+/// A broken link: the page that links to it and why it failed.
+pub fn broken(r: crawler.Report) -> [crawler.Page] {
+    r.pages.filter(fn(p: crawler.Page) -> bool {
+        (p.kind == "page" && p.status >= 400) || p.kind == "error" || p.kind == "lost"
+    })
+}
+
+pub fn chains(r: crawler.Report) -> [crawler.Page] {
+    r.pages.filter(fn(p: crawler.Page) -> bool { p.redirects.len() > 0 })
+}
+
+fn rate(n: int, ms: int) -> string {
+    if (ms <= 0) {
+        return "-";
+    }
+    let tenths = n * 10000 / ms;
+    "${tenths / 10}.${tenths % 10}"
+}
+
+/// The human summary (stderr or --report).
+pub fn summary(r: crawler.Report) -> string {
+    let s = stats(r);
+    var out = "== raycrawl summary ==\n";
+    out = out
+        + "URLs: ${s.total} (fetched ${s.fetched}), ${s.bytes_total} bytes, ${r.elapsed_ms} ms, ${rate(s.fetched, r.elapsed_ms)} pages/s\n";
+    var kinds: [string] = [];
+    for (k, n) in s.by_kind {
+        kinds.push("${k} ${n}");
+    }
+    out = out + "Kinds: ${kinds.join(", ")}\n";
+    var codes: [string] = [];
+    for (c, n) in s.by_status {
+        codes.push("${c}×${n}");
+    }
+    out = out + "Status: ${codes.join("  ")}\n";
+    if (s.by_charset.len() > 0) {
+        var cs: [string] = [];
+        for (c, n) in s.by_charset {
+            cs.push("${c}×${n}");
+        }
+        out = out + "Charsets: ${cs.join(", ")}\n";
+    }
+    var ws: [string] = [];
+    for (w, n) in s.by_worker {
+        ws.push("w${w}:${n}");
+    }
+    out = out + "Scheduler workers: ${ws.join(" ")}\n";
+    out = out
+        + "Retried: ${s.retried}  Truncated: ${s.truncated}  Over --max-pages: ${r.over_limit}";
+    if (r.from_sitemaps > 0) {
+        out = out + "  From sitemaps: ${r.from_sitemaps}";
+    }
+    out = out + "\n";
+    if (r.interrupted) {
+        out = out + "Interrupted by a signal: the queue was dropped.\n";
+    }
+    if (r.timed_out) {
+        out = out + "Stopped by --max-time.\n";
+    }
+    let b = broken(r);
+    if (b.len() > 0) {
+        out = out + "\nBroken (${b.len()}):\n";
+        for p in b {
+            let why = if (p.error != "") { p.error } else { "HTTP ${p.status}" };
+            let from = if (p.referrer != "") { "  ← ${p.referrer}" } else { "" };
+            out = out + "  ${text.pad_right(why, 28, " ")} ${p.url}${from}\n";
+        }
+    }
+    let c = chains(r);
+    if (c.len() > 0) {
+        out = out + "\nRedirect chains (${c.len()}):\n";
+        for p in c {
+            var line = "  ";
+            for h in p.redirects {
+                line = line + "${h.url} -${h.status}-> ";
+            }
+            line = line + p.final_url;
+            if (p.error != "") {
+                line = line + "  [${p.error}]";
+            } else if (p.offsite_redirect) {
+                line = line + "  [off-site]";
+            } else {
+                line = line + "  [${p.status}]";
+            }
+            out = out + line + "\n";
+        }
+    }
+    if (r.crashed.len() > 0) {
+        out = out + "\nCrashed host workers (${r.crashed.len()}):\n";
+        for (origin, e) in r.crashed {
+            out = out + "  ${origin}: ${e}\n";
+        }
+    }
+    out
+}
