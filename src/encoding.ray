@@ -83,48 +83,6 @@ pub fn meta_charset(b: bytes) -> Option<string> {
     }
 }
 
-/// The byte offset in a `charset.decode` error ("… at byte N"), if it says one.
-fn error_offset(e: string) -> Option<int> {
-    match (e.last_index_of("at byte ")) {
-        Option.Some(i) => parse_int(e.substring(i + 8, e.len()).trim()),
-        Option.None => Option.None,
-    }
-}
-
-/// Decodes like a browser: a malformed sequence becomes U+FFFD and decoding goes on.
-/// `charset.decode` is strict (an `Err` with the offset), so the lossy mode is rebuilt here:
-/// decode up to the bad byte, emit U+FFFD, skip one byte, repeat. `Err` = unknown label.
-pub fn decode_lossy(b: bytes, label: string) -> Result<(string, int), string> {
-    var parts: [string] = [];
-    var rest = b;
-    var replaced = 0;
-    while (true) {
-        match (charset.decode(rest, label)) {
-            Result.Ok(s) => {
-                parts.push(s);
-                break;
-            },
-            Result.Err(e) => {
-                let at = match (error_offset(e)) {
-                    Option.Some(n) => n,
-                    Option.None => return Result.Err(e),
-                };
-                if (at > 0) {
-                    let head = charset.decode(rest.sub_bytes(0, at), label)?;
-                    parts.push(head);
-                }
-                parts.push("\u{FFFD}");
-                replaced = replaced + 1;
-                rest = rest.sub_bytes(at + 1, rest.len());
-                if (rest.len() == 0) {
-                    break;
-                }
-            },
-        }
-    }
-    Result.Ok((parts.join(""), replaced))
-}
-
 fn known(label: string) -> bool {
     charset.decode(bytes_of([]), label).is_ok()
 }
@@ -132,7 +90,8 @@ fn known(label: string) -> bool {
 /// Detects the charset of an HTML (or text) body and decodes it to a string.
 pub fn decode_body(body: bytes, content_type: string) -> Decoded {
     if let Option.Some((label, skip)) = sniff_bom(body) {
-        let (text, bad) = decode_lossy(body.sub_bytes(skip, body.len()), label).unwrap_or(("", 0));
+        let (text, bad) = charset.decode_lossy(body.sub_bytes(skip, body.len()), label)
+            .unwrap_or(("", 0));
         return Decoded { text: text, label: label, source: "bom", replaced: bad };
     }
     var label = "utf-8";
@@ -159,7 +118,7 @@ pub fn decode_body(body: bytes, content_type: string) -> Decoded {
         match (charset.decode(body, "utf-8")) {
             Result.Ok(t) => return Decoded { text: t, label: "utf-8", source: "default", replaced: 0 },
             Result.Err(_) => {
-                let (t, bad) = decode_lossy(body, "windows-1252").unwrap_or(("", 0));
+                let (t, bad) = charset.decode_lossy(body, "windows-1252").unwrap_or(("", 0));
                 return Decoded {
                     text: t,
                     label: "windows-1252",
@@ -169,6 +128,6 @@ pub fn decode_body(body: bytes, content_type: string) -> Decoded {
             },
         }
     }
-    let (text, bad) = decode_lossy(body, label).unwrap_or(("", 0));
+    let (text, bad) = charset.decode_lossy(body, label).unwrap_or(("", 0));
     Decoded { text: text, label: label, source: source, replaced: bad }
 }

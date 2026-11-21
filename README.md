@@ -37,7 +37,7 @@ raycrawl bench [--pages N] [--per-host N] [--hosts H] [--site BASE]   páginas/s
 | `--max-hosts N` | 8 | orígenes rastreados a la vez |
 | `--delay MS` | 250 | separación mínima entre dos peticiones a un host (`Crawl-delay` puede subirla, hasta 30 s) |
 | `--timeout MS` | 10000 | presupuesto de un intento (conexión + cabecera + cuerpo) |
-| `--retries N` | 2 | reintentos para 5xx, 429, timeouts y errores de red |
+| `--retries N` | 2 | reintentos para 5xx, 429, timeouts y errores de red; respeta `Retry-After` en segundos (más de 30 s = no se reintenta) |
 | `--max-bytes N` | 2 MiB | el cuerpo se corta ahí; la página queda marcada `truncated` |
 | `--scope S` | `host` | `host`, `domain` (dos últimas etiquetas, sin PSL), `prefix` o `any` |
 | `--sitemaps` | no | sembrar también desde los sitemaps (`Sitemap:` de robots.txt, o `/sitemap.xml`) |
@@ -57,13 +57,13 @@ vuelo y escribe el resumen igualmente.
 
 | Pieza | Módulo | raylang |
 |---|---|---|
-| Normalización de URLs (esquema/host en minúsculas, sin puerto por defecto, sin `.`/`..`, `%XX` en mayúsculas y no reservados decodificados, sin fragmento) y deduplicación | `urlnorm` | `std/url` (`parse`, `resolve` RFC 3986, `remove_dot_segments`, `render`), `std/collections/set` |
-| robots.txt RFC 9309: grupos por user-agent (se fusionan; `*` solo si ninguno nombra al agente), Allow/Disallow con `*` y `$`, gana la regla más larga y Allow en empate, `Crawl-delay`, `Sitemap:`; 4xx = todo permitido, 5xx o red = todo prohibido | `robots` | `std/regex` (cada patrón compilado a una regex anclada) |
+| Normalización de URLs (esquema/host en minúsculas, sin puerto por defecto, sin `.`/`..`, `%XX` en mayúsculas y no reservados decodificados, sin fragmento) y deduplicación | `urlnorm` | `std/url` (`normalize` RFC 3986 §6, `escape_unsafe`, `resolve`, `render`), `std/collections/set` |
+| robots.txt RFC 9309: grupos por user-agent (se fusionan; `*` solo si ninguno nombra al agente), Allow/Disallow con `*` y `$`, gana la regla más larga y Allow en empate, `Crawl-delay`, `Sitemap:`; 4xx = todo permitido, 5xx o red = todo prohibido | `robots` | `std/regex` (cada patrón compilado a una regex anclada, los tramos literales con `escape`) |
 | Sitemaps `urlset` e índice, con prefijo de namespace, en gzip (detectado por el número mágico), en texto plano; los hijos de un índice se piden en paralelo dentro de un `scope` | `sitemap`, `crawler` | `std/xml` (rechaza DTD: sin XXE), `std/inflate` (`gunzip_limit`, tope de 50 MB) |
-| Charset: BOM > `Content-Type` > `<meta charset>` / `http-equiv` en los primeros 1024 bytes > UTF-8, y windows-1252 si el UTF-8 no es válido; los bytes malformados se sustituyen por U+FFFD | `encoding` | `std/charset` (ISO-8859-1, windows-1252, Shift_JIS, UTF-16…) |
+| Charset: BOM > `Content-Type` > `<meta charset>` / `http-equiv` en los primeros 1024 bytes > UTF-8, y windows-1252 si el UTF-8 no es válido; los bytes malformados se sustituyen por U+FFFD | `encoding` | `std/charset` (`decode_lossy`; ISO-8859-1, windows-1252, Shift_JIS, UTF-16…) |
 | HTML: título, enlaces (`a`, `area`, `iframe`), `<base>`, canonical, `meta robots` (noindex/nofollow), `rel=nofollow`, entidades, texto visible (sin `script`/`style`/comentarios) normalizado NFC | `html` | `std/text` (`nfc`, `words`), `stringbuilder` |
-| Descarga en streaming con tope de bytes y presupuesto de tiempo; redirecciones seguidas a mano para registrar la cadena (bucles, límite de saltos, robots del destino, cambio de host) | `fetch` | `net/http` (`stream_with`, `stream_read`, `stream_close`), `std/resilience` (`deadline`) |
-| Reintentos con espera exponencial + jitter solo para lo reintentable; cortacircuitos por host | `fetch`, `crawler` | `std/resilience` (`policy`/`retry`, `breaker`/`admit`/`report`) |
+| Descarga en streaming con tope de bytes y presupuesto de tiempo, sobre un pool de conexiones persistentes por host; redirecciones seguidas a mano para registrar la cadena (bucles, límite de saltos, robots del destino, cambio de host) | `fetch` | `net/http` (`pool`, `pool_stream`, `stream_read`, `stream_close`), `std/resilience` (`deadline`) |
+| Reintentos con espera exponencial + jitter solo para lo reintentable, o el `Retry-After` del servidor; cortacircuitos por host | `fetch`, `crawler` | `std/resilience` (`policy`/`retry_with`, `breaker`/`admit`/`report`) |
 | Concurrencia (abajo) | `crawler` | `spawn_isolated`, `spawn_local`, `scope`, `try_join`, `try_call`, `select`, `select_timeout`, `try_send`, `try_recv`, `worker_id`/`worker_count`, `signals()` |
 
 ### Concurrencia
@@ -73,7 +73,8 @@ vuelo y escribe el resumen igualmente.
   está llena, el trabajo sigue en la cola local (sin bloquearse nunca). Espera eventos con
   `select_timeout`, que también le sirve de reloj para `--max-time`.
 - Cada **origen** tiene su trabajador, lanzado con **`spawn_isolated`**: un dominio de handles nuevo,
-  así que los sockets de un host no pueden filtrarse a otro ni ser tocados desde fuera.
+  así que los sockets de un host no pueden filtrarse a otro ni ser tocados desde fuera. El pool de
+  conexiones (`http.pool(per_host)`) se crea dentro, y sus fetchers lo comparten.
 - Dentro, un **despachador** baja robots.txt, aplica el ritmo (`--delay` / `Crawl-delay`) y el
   **cortacircuitos**, y entrega cada URL por un canal de rendezvous a `--per-host` **fetchers**
   lanzados con **`spawn_local`** (fijados al mismo hilo que su despachador: en nativo, todas las
@@ -94,12 +95,12 @@ vuelo y escribe el resumen igualmente.
 `http-equiv`), Shift_JIS (por `<meta charset>`), UTF-8 con BOM y cabecera equivocada, UTF-16;
 variantes de robots.txt (normal, `Crawl-delay`, 404, 503); sitemap, sitemap en gzip e índice con un
 hijo roto; cadenas de redirecciones 301→302→307, un bucle, una redirección a otro host; una página
-lenta, una que da 503 dos veces antes de responder, una que siempre da 503, un 500, un 404, una
+lenta, una que da 503 dos veces antes de responder, una que siempre da 503, un 500, un 404, una que pide `Retry-After`, una
 página de 3 MiB, una imagen, texto plano, una cadena de páginas para la profundidad y un árbol
 generado para medir.
 
 ```
-make test          # 39 pruebas en la VM
+make test          # 40 pruebas en la VM
 make test-native   # las mismas, como binarios nativos
 make demo          # rastrea el sitio de pruebas con el binario nativo
 make bench         # páginas/s: nativo vs VM, 1 vs N fetchers, 1 vs 4 hosts
@@ -108,65 +109,54 @@ make interop       # OPCIONAL: robots.txt + 5 páginas de un sitio público real
 
 ## Rendimiento
 
-`make bench` (macOS, M-series, 11 workers, raylang 1.27.95, net 0.15.0): árbol de 1500 páginas
-de ~0,9 KB servido en el mismo proceso, sin retardo ni texto en la salida. Cada petición es una
-conexión TCP nueva (el cliente en streaming de `net` no reutiliza conexiones), así que el script
-espera a que se vacíe TIME_WAIT entre corridas: sin eso, los puertos efímeros se agotan (16.543
-sockets en TIME_WAIT medidos) y las cifras se hunden hasta 250 páginas/s.
+`make bench` (macOS, M-series, 11 workers, raylang 1.27.110, net 0.17.0): árbol de 1500 páginas
+de ~0,9 KB servido en el mismo proceso, sin retardo ni texto en la salida. Cada host reutiliza sus
+conexiones (`http.pool_stream`): tras una corrida queda ~1 socket en TIME_WAIT. Con net 0.15 cada
+petición era una conexión nueva, se acumulaban 16.543 sockets en TIME_WAIT y el script tenía que
+esperar a que se vaciaran; entre paréntesis, las cifras de entonces (raylang 1.27.95).
 
 | Configuración | Nativo | VM |
 |---|---:|---:|
-| 1 host, 1 fetcher | 6.250 p/s | 1.483 p/s |
-| 1 host, 4 fetchers | 11.627 p/s | 2.555 p/s |
-| 1 host, 16 fetchers | 9.316 p/s | 5.395 p/s |
-| 4 hosts, 4 fetchers | 12.931 p/s | 5.769 p/s |
+| 1 host, 1 fetcher | 15.789 p/s (6.250) | 1.742 p/s (1.483) |
+| 1 host, 4 fetchers | 26.785 p/s (11.627) | 4.285 p/s (2.555) |
+| 1 host, 16 fetchers | 27.272 p/s (9.316) | 8.196 p/s (5.395) |
+| 4 hosts, 4 fetchers | 68.181 p/s (12.931) | 7.978 p/s (5.769) |
 
 En nativo, un host usa un solo hilo del planificador (`spawn_local`); con 4 hosts se reparten en 4.
-Una página cuesta ~160 µs en nativo (descarga + charset + HTML + enlaces) y ~850 µs en la VM.
+Una página cuesta ~60 µs en nativo (descarga + charset + HTML + enlaces) y ~570 µs en la VM.
 
 ## Estado
 
 | Qué | Estado |
 |---|---|
-| URLs, robots.txt, charset, HTML, sitemaps | **30 pruebas unitarias**, VM y nativo (raylang 1.27.95, `raylang = "1.27.94"` en ray.toml) |
-| Rastreo de punta a punta contra el sitio local | **9 pruebas**, VM y nativo |
+| URLs, robots.txt, charset, HTML, sitemaps | **30 pruebas unitarias**, VM y nativo (raylang 1.27.110; `raylang = "1.27.108"` y net 0.17 en ray.toml) |
+| Rastreo de punta a punta contra el sitio local | **10 pruebas**, VM y nativo |
 | Binario nativo `--release` | compila y pasa la demo |
 | Interop real | `www.rust-lang.org`: 301 a otro host seguido como nueva raíz, 4 páginas por TLS |
 
-Pendiente: conexiones persistentes por host (no hay streaming sobre `http.pool`), `Retry-After`,
-lista de sufijos públicos para `--scope domain`, `<meta http-equiv=refresh>`, reanudar un rastreo
+Pendiente: `Retry-After` en forma de fecha HTTP, lista de sufijos públicos para `--scope domain`, `<meta http-equiv=refresh>`, reanudar un rastreo
 (frontera en disco), y que Ctrl-C también vacíe la cola ya entregada a cada host (hoy se despachan
 las hasta `2 × per-host` URLs que ya estaban en ella).
 
 ## Hallazgos de dogfood
 
-Registrados en `ray-apps/findings/` (campaña `raycrawl-1.27.95`), con su número entre paréntesis:
+Registrados en `ray-apps/findings/` (campaña `raycrawl-1.27.95`, re-medida con 1.27.108 y 1.27.110,
+y `raycrawl-1.27.110`). Cerrados todos menos #469, y raycrawl ya usa lo que los resolvió:
 
-1. (#363) **[E] std/charset** — `decode` es solo estricto: un byte malformado es `Err` con el offset dentro
-   del mensaje. Un navegador sustituye por U+FFFD; aquí hubo que reconstruir el modo con pérdida
-   decodificando por tramos y extrayendo el offset del texto del error (`encoding.decode_lossy`).
-2. (#364) **[E] std/resilience** — `retry` reintenta cualquier `Err`: no hay predicado de "reintentable",
-   ni `Retry-After`, ni número de intento. Hubo que codificar "definitivo" como `Ok` y contar con una
-   variable capturada.
-3. (#370) **[E] net/http** — no hay streaming sobre una conexión persistente (`stream_with` siempre abre
-   una conexión nueva con `Connection: close`; `pool`/`conn_*` bufferizan el cuerpo entero). Un
-   crawler necesita las dos cosas (tope de bytes y keep-alive): a ~6.000 p/s se agotan los puertos
-   efímeros.
-4. (#365) **[E] std/regex** — no hay `escape(literal)`; robots.txt necesita citar texto literal.
-5. (#366) **[E] std/url** — sin normalización RFC 3986 §6 (`%xx` en mayúsculas, decodificar no reservados,
-   puerto por defecto) ni un escape de "lo que no puede ir crudo" para un `href` con espacios o
-   no-ASCII: `url_encode` lo codifica todo, `/` incluida.
-6. (#371) **[E] net/webserver** — con `quiet()`, un cliente que cuelga a mitad de respuesta sigue
-   escribiendo `response: Broken pipe (os error 32)` (o `Connection reset by peer`) en stderr.
-7. (#367) **[D] std/text** — `words` no corta en NBSP (U+00A0) y `trim` sí lo quita: dos criterios de
-   «espacio» en la misma librería, sin documentar.
-8. (#368) **[D] concurrencia** — `ray_doc try_join` es solo la firma; la doc de `spawn_isolated` no dice
-   que los canales sí cruzan dominios ni que los hijos de `spawn_local` heredan el dominio (ambas
-   cosas verificadas a mano).
-9. (#369) **[B] divergencia de mensaje VM/nativo** — un `tcp_accept` desde `spawn_isolated` sobre un
-   listener de otro dominio da `invalid handle: 1` en la VM y `handle 1 is not a listener` en nativo.
+| # | Tipo | Qué faltaba | Cerrado en | Lo que usa raycrawl ahora |
+|---:|---|---|---|---|
+| 363 | E | `std/charset` solo estricto: un byte malo perdía la página | 1.27.108 | `charset.decode_lossy` (fuera el rodeo que leía el offset del mensaje de error) |
+| 364 | E | `std/resilience.retry` reintentaba cualquier `Err`, sin número de intento ni `Retry-After` | 1.27.108 | `retry_with`: número de intento y `Retry-After` |
+| 365 | E | `std/regex` sin `escape` | 1.27.108 | `regex.escape` en `robots.compile_pattern` |
+| 366 | E | `std/url` sin normalización RFC 3986 §6 ni escape de un `href` | 1.27.108 | `url.normalize` y `url.escape_unsafe` (fuera ~90 líneas de `urlnorm`) |
+| 367 | D | `text.words` no cortaba en NBSP y `trim` sí | 1.27.108 | `text.words` a secas (fuera el `replace` de U+00A0) |
+| 368 | D | huecos en la doc de `try_join`, `spawn_isolated` y `scope` | 1.27.110 | — |
+| 369 | B | mensaje distinto en VM y nativo para un handle de otro dominio | 1.27.108 | — |
+| 370 | E | `net/http` sin streaming sobre una conexión persistente | net 0.17.0 | `http.pool_stream`, un pool por host (de 2,5× a 5× en nativo) |
+| 371 | E | `net/webserver.quiet()` dejaba pasar los `Broken pipe` de los cortes del cliente | net 0.17.0 | — (los tests ya no ensucian stderr) |
+| 469 | D/E | `url.escape_unsafe` dice imitar al navegador con un `href`, pero codifica los espacios de los extremos y los `\t`/`\n` en vez de quitarlos (`"  /x"` se resuelve como ruta relativa) | abierto | rodeo: `urlnorm.escape_href` limpia antes |
 
 Lo que salió bien: `spawn_isolated`, `spawn_local`, `scope` con cancelación, `try_join`, `try_call`,
 `select_timeout`, `try_send`/`try_recv` funcionaron a la primera **y con el mismo comportamiento en VM
-y nativo**: las 39 pruebas pasaron en nativo sin un solo cambio. `std/charset`, `std/xml`,
+y nativo**: las 39 pruebas de entonces pasaron en nativo sin un solo cambio. `std/charset`, `std/xml`,
 `std/inflate`, `std/url.resolve` y `std/text.nfc` también a la primera.

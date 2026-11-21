@@ -220,7 +220,7 @@ fn cmd_robots(c: Cli) -> int {
         },
     };
     let origin = urlnorm.origin(u);
-    let rb = fetch.fetch_robots(origin, c.cfg);
+    let rb = fetch.fetch_robots(origin, c.cfg, Option.None);
     let p = robots.policy_for(rb, c.cfg.user_agent);
     print("robots.txt: ${origin}/robots.txt (${rb.source}, ${rb.groups.len()} group(s))");
     let token = robots.product_token(c.cfg.user_agent);

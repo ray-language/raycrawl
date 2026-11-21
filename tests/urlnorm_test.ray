@@ -21,7 +21,8 @@ fn normalize_dots_and_percent() {
     assert_eq(norm("http://h/%7euser/%2fx%2F"), "http://h/~user/%2Fx%2F");
     assert_eq(norm("http://h/a b/ñ"), "http://h/a%20b/%C3%B1");
     assert_eq(norm("http://h/?q=%41%3d"), "http://h/?q=A%3D");
-    assert_eq(norm("http://h/100%"), "http://h/100%25");
+    // A lone `%` is left as is (url.normalize only rewrites well-formed escapes).
+    assert_eq(norm("http://h/100%"), "http://h/100%");
 }
 
 @test

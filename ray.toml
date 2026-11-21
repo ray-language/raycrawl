@@ -2,7 +2,7 @@
 name = "raycrawl"
 version = "0.1.0"
 license = "Apache-2.0"
-raylang = "1.27.94"
+raylang = "1.27.108"
 
 [dependencies]
-net = "^0.15.0"
+net = "^0.17.0"

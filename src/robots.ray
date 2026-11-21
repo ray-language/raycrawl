@@ -45,28 +45,13 @@ pub fn disallow_all() -> Robots {
     Robots { groups: [], sitemaps: [], source: "unreachable" }
 }
 
-const META: string = ".+?()[]{}|\\^";
-
 /// Compiles a robots path pattern: `*` = any run of characters, a trailing `$` = end of path,
 /// everything else literal; anchored at the start of the path.
 pub fn compile_pattern(pattern: string) -> Result<regex.Regex, string> {
-    var re = "^";
-    let cs = pattern.chars();
-    var i = 0;
-    while (i < cs.len()) {
-        let c = cs[i];
-        if (c == '*') {
-            re = re + ".*";
-        } else if (c == '$' && i == cs.len() - 1) {
-            re = re + "$";
-        } else if (META.contains(to_string(c)) || c == '$') {
-            re = re + "\\" + to_string(c);
-        } else {
-            re = re + to_string(c);
-        }
-        i = i + 1;
-    }
-    regex.compile(re)
+    let anchored = pattern.ends_with("$");
+    let body = if (anchored) { pattern.substring(0, pattern.len() - 1) } else { pattern };
+    let literal = body.split("*").map(fn(piece: string) -> string { regex.escape(piece) });
+    regex.compile("^" + literal.join(".*") + if (anchored) { "$" } else { "" })
 }
 
 fn parse_delay(v: string) -> Option<int> {
@@ -120,7 +105,7 @@ pub fn parse(body: string) -> Robots {
             if (agents.len() == 0 || value == "") {
                 continue;
             }
-            let pat = urlnorm.normalize_percent(value);
+            let pat = urlnorm.normalize_path(value);
             if let Result.Ok(re) = compile_pattern(pat) {
                 rules.push(Rule { allow: key == "allow", pattern: pat, re: re });
             }
@@ -199,7 +184,7 @@ pub fn allowed(p: Policy, path: string) -> bool {
     if (p.disallow_all) {
         return false;
     }
-    let target = urlnorm.normalize_percent(path);
+    let target = urlnorm.normalize_path(path);
     var best = -1;
     var verdict = true;
     for r in p.rules {
@@ -216,7 +201,7 @@ pub fn allowed(p: Policy, path: string) -> bool {
 
 /// The rule that decided `allowed` (for `raycrawl robots`), or "" when none matched.
 pub fn deciding_rule(p: Policy, path: string) -> string {
-    let target = urlnorm.normalize_percent(path);
+    let target = urlnorm.normalize_path(path);
     var best = -1;
     var line = "";
     var allow = false;

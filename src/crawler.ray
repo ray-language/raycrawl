@@ -11,6 +11,7 @@ import std/time;
 import std/resilience;
 import std/collections/deque;
 import std/collections/set;
+import net/http;
 import config;
 import fetch;
 import robots;
@@ -122,8 +123,13 @@ fn is_html(ct: string) -> bool {
 }
 
 /// Fetches and digests one URL (runs in a fetcher fiber).
-pub fn process(job: Job, cfg: config.Config, policy: robots.Policy) -> Page {
-    let f = fetch.fetch_page(job.url, cfg, policy);
+pub fn process(
+    job: Job,
+    cfg: config.Config,
+    policy: robots.Policy,
+    via: Option<http.Pool>
+) -> Page {
+    let f = fetch.fetch_page(job.url, cfg, policy, via);
     var p = blank(job, if (f.error == "") { "page" } else { "error" }, f.error);
     p.final_url = f.final_url;
     p.status = f.status;
@@ -186,7 +192,8 @@ fn fetcher(
     outcomes: Channel<HostMsg>,
     events: Channel<Event>,
     cfg: config.Config,
-    policy: robots.Policy
+    policy: robots.Policy,
+    via: Option<http.Pool>
 ) -> int {
     var n = 0;
     while (true) {
@@ -194,7 +201,7 @@ fn fetcher(
             Option.Some(j) => j,
             Option.None => break,
         };
-        let page = match (try_call(fn() -> Page { process(job, cfg, policy) })) {
+        let page = match (try_call(fn() -> Page { process(job, cfg, policy, via) })) {
             Result.Ok(pg) => pg,
             Result.Err(e) => blank(job, "error", "panic while processing: ${e}"),
         };
@@ -218,15 +225,18 @@ pub fn host_gap(cfg: config.Config, policy: robots.Policy) -> int {
     }
 }
 
-/// One origin's worker (runs in its own handle domain).
+/// One origin's worker (runs in its own handle domain). Its fetchers share one keep-alive
+/// pool of `per_host` connections, created here so its sockets belong to this domain.
 fn host_main(
     origin: string,
     jobs: Channel<HostMsg>,
     events: Channel<Event>,
     cfg: config.Config
 ) -> int {
+    let conns = http.pool(cfg.per_host);
+    let via = Option.Some(conns);
     let rb = if (cfg.respect_robots) {
-        fetch.fetch_robots(origin, cfg)
+        fetch.fetch_robots(origin, cfg, via)
     } else {
         robots.allow_all("ignored")
     };
@@ -235,10 +245,10 @@ fn host_main(
     let breaker = resilience.breaker(cfg.breaker_threshold, cfg.breaker_cooldown_ms);
     let work: Channel<Job> = Channel.bounded(0);
     let outcomes: Channel<HostMsg> = Channel.new();
-    scope(fn() -> int {
+    let dispatched = scope(fn() -> int {
         var k = 0;
         while (k < cfg.per_host) {
-            spawn_local(fn() -> int { fetcher(work, outcomes, events, cfg, policy) });
+            spawn_local(fn() -> int { fetcher(work, outcomes, events, cfg, policy, via) });
             k = k + 1;
         }
         var next_start = 0;
@@ -294,7 +304,9 @@ fn host_main(
         }
         close(work);
         dispatched
-    })
+    });
+    http.pool_close(conns);
+    dispatched
 }
 
 /// Starts a host worker in a fresh handle domain plus the watcher that turns its end (or
@@ -378,7 +390,7 @@ fn read_sitemap(
     cfg: config.Config,
     allow: robots.Policy
 ) -> Result<sitemap.Sitemap, string> {
-    let f = fetch.fetch_page(u, cfg, allow);
+    let f = fetch.fetch_page(u, cfg, allow, Option.None);
     if (f.error != "") {
         return Result.Err(f.error);
     }
@@ -393,7 +405,7 @@ fn read_sitemap(
 
 /// The sitemaps of an origin: the robots.txt `Sitemap:` lines, else `/sitemap.xml`.
 pub fn discover_sitemaps(origin: string, cfg: config.Config) -> [string] {
-    let rb = fetch.fetch_robots(origin, cfg);
+    let rb = fetch.fetch_robots(origin, cfg, Option.None);
     var found: [string] = [];
     for s in rb.sitemaps {
         if let Result.Ok(u) = urlnorm.resolve("${origin}/robots.txt", s) {

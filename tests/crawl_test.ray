@@ -259,3 +259,26 @@ fn a_seed_redirecting_to_another_host_moves_the_scope() {
     // Nothing else of host a: /hop is the only page fetched there.
     assert_eq(r.pages.filter(fn(p: crawler.Page) -> bool { p.url.starts_with(a.base) }).len(), 1);
 }
+
+@test
+fn retry_after_is_honoured_up_to_a_limit() {
+    let s = site("default");
+    let c = fast();
+    c.max_depth = 0;
+    let t0 = time.monotonic();
+    let r = run(["${s.base}/retry-after/1"], c);
+    let ms = time.monotonic() - t0;
+    let p = find(r, "/retry-after/1").unwrap();
+    assert_eq(p.status, 200);
+    assert_eq(p.attempts, 2);
+    // The server's 1 s, not the 20 ms backoff.
+    assert(ms >= 1000);
+    // An hour is past MAX_RETRY_AFTER_MS: no second attempt.
+    let long = run(["${s.base}/retry-after/3600"], c);
+    let q = find(long, "/retry-after/3600").unwrap();
+    assert_eq(q.status, 503);
+    assert_eq(q.attempts, 1);
+    testsite.stop(s);
+    assert_eq(fetch.retry_after_ms(" 2 "), 2000);
+    assert_eq(fetch.retry_after_ms("Wed, 21 Oct 2026 07:28:00 GMT"), -1);
+}

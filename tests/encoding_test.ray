@@ -69,11 +69,10 @@ fn utf16_bom() {
 }
 
 @test
-fn lossy_decode_replaces_bad_bytes() {
+fn bad_bytes_become_replacement_characters() {
     let bad = bytes_concat([enc("あ", "shift_jis"), bytes_of([0xFF]), enc("い", "shift_jis")]);
-    let (t, n) = encoding.decode_lossy(bad, "shift_jis").unwrap();
-    assert_eq(n, 1);
-    assert_eq(t, "あ\u{FFFD}い");
     let d = encoding.decode_body(bytes_concat(["<meta charset=shift_jis>".to_bytes(), bad]), "");
+    assert_eq(d.label, "shift_jis");
     assert_eq(d.replaced, 1);
+    assert(d.text.ends_with("あ\u{FFFD}い"));
 }

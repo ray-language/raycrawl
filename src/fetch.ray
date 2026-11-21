@@ -36,6 +36,8 @@ pub struct Attempt {
     status: int,
     content_type: string,
     location: string,
+    /// What a `Retry-After` header asked for, in ms (-1 = none or not understood).
+    retry_after_ms: int,
     body: bytes,
     truncated: bool,
     error: string,
@@ -46,6 +48,18 @@ const RETRY_STATUS: [int] = [429, 500, 502, 503, 504];
 /// Network errors, timeouts and the "try again later" statuses are worth another attempt.
 pub fn retryable(a: Attempt) -> bool {
     a.error != "" || RETRY_STATUS.contains(a.status)
+}
+
+/// The longest `Retry-After` the crawler honours; asking for more gives up at once.
+pub const MAX_RETRY_AFTER_MS: int = 30000;
+
+/// A `Retry-After` value in ms: only the delay-seconds form (RFC 9110 §10.2.3). An HTTP-date
+/// or garbage is -1, so the policy's backoff applies.
+pub fn retry_after_ms(v: string) -> int {
+    match (parse_int(v.trim())) {
+        Option.Some(n) if n >= 0 => n * 1000,
+        _ => -1,
+    }
 }
 
 /// Bodies the crawler reads (HTML, XML, text); for anything else only the head matters.
@@ -64,6 +78,7 @@ fn failed(e: string) -> Attempt {
         status: 0,
         content_type: "",
         location: "",
+        retry_after_ms: -1,
         body: bytes_of([]),
         truncated: false,
         error: e
@@ -72,21 +87,31 @@ fn failed(e: string) -> Attempt {
 
 /// One GET, never more than `cfg.timeout_ms` of silence per read nor of total time, and never
 /// more than `cfg.max_bytes` of body (the stream is closed there and the page marked truncated).
-pub fn fetch_once(target: string, cfg: config.Config) -> Attempt {
+///
+/// With `via`, the request goes through that keep-alive pool (`http.pool_stream`): a body read
+/// to the end hands the connection back, an early close (cap, deadline, head only) drops it.
+/// Without it, a fresh connection per request (`http.stream_with`).
+pub fn fetch_once(target: string, cfg: config.Config, via: Option<http.Pool>) -> Attempt {
     let budget = resilience.deadline(cfg.timeout_ms);
     let headers: Map<string, string> = Map.new();
     headers.insert("User-Agent", cfg.user_agent);
     headers.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-    let s = match (http.stream_with("GET", target, bytes_of([]), headers, cfg.timeout_ms)) {
+    let opened = match (via) {
+        Option.Some(p) => http.pool_stream(p, "GET", target, bytes_of([]), headers, cfg.timeout_ms),
+        Option.None => http.stream_with("GET", target, bytes_of([]), headers, cfg.timeout_ms),
+    };
+    let s = match (opened) {
         Result.Ok(s) => s,
         Result.Err(e) => return failed(e),
     };
     let ct = s.headers.get_or("content-type", "");
     let loc = s.headers.get_or("location", "");
+    let ra = retry_after_ms(s.headers.get_or("retry-after", ""));
     let head = Attempt {
         status: s.status,
         content_type: ct,
         location: loc,
+        retry_after_ms: ra,
         body: bytes_of([]),
         truncated: false,
         error: ""
@@ -103,6 +128,7 @@ pub fn fetch_once(target: string, cfg: config.Config) -> Attempt {
                 status: s.status,
                 content_type: ct,
                 location: loc,
+                retry_after_ms: ra,
                 body: buf.build(),
                 truncated: true,
                 error: "deadline exceeded after ${cfg.timeout_ms} ms"
@@ -118,6 +144,7 @@ pub fn fetch_once(target: string, cfg: config.Config) -> Attempt {
                         status: s.status,
                         content_type: ct,
                         location: loc,
+                        retry_after_ms: ra,
                         body: all.sub_bytes(0, cfg.max_bytes),
                         truncated: true,
                         error: ""
@@ -131,6 +158,7 @@ pub fn fetch_once(target: string, cfg: config.Config) -> Attempt {
                     status: s.status,
                     content_type: ct,
                     location: loc,
+                    retry_after_ms: ra,
                     body: buf.build(),
                     truncated: true,
                     error: e
@@ -142,33 +170,50 @@ pub fn fetch_once(target: string, cfg: config.Config) -> Attempt {
         status: s.status,
         content_type: ct,
         location: loc,
+        retry_after_ms: ra,
         body: buf.build(),
         truncated: false,
         error: ""
     }
 }
 
-/// `fetch_once` under the retry policy: `cfg.retries` more tries, backoff doubling from
-/// `cfg.backoff_ms`. Returns the last attempt and how many were made.
-pub fn fetch_retrying(target: string, cfg: config.Config) -> (Attempt, int) {
-    var n = 0;
+/// `fetch_once` under the retry policy: `cfg.retries` more tries for what `retryable` accepts,
+/// backoff doubling from `cfg.backoff_ms` — or the server's `Retry-After`, up to
+/// `MAX_RETRY_AFTER_MS` (beyond that it gives up). Returns the last attempt and how many were made.
+pub fn fetch_retrying(
+    target: string,
+    cfg: config.Config,
+    via: Option<http.Pool>
+) -> (Attempt, int) {
+    var made = 0;
     let p = resilience.policy(cfg.retries + 1, cfg.backoff_ms, cfg.backoff_ms * 8);
-    let r: Result<Attempt, Attempt> = resilience.retry(p, fn() -> Result<Attempt, Attempt> {
-        n = n + 1;
-        let a = fetch_once(target, cfg);
+    let r: Result<Attempt, Attempt> = resilience.retry_with(p, fn(attempt: int, a: Attempt) -> int {
+        if (a.retry_after_ms > MAX_RETRY_AFTER_MS) {
+            resilience.STOP
+        } else {
+            a.retry_after_ms
+        }
+    }, fn(attempt: int) -> Result<Attempt, Attempt> {
+        made = attempt;
+        let a = fetch_once(target, cfg, via);
         if (retryable(a)) { Result.Err(a) } else { Result.Ok(a) }
     });
     let a = match (r) {
         Result.Ok(v) => v,
         Result.Err(v) => v,
     };
-    return (a, n);
+    (a, made)
 }
 
 /// Fetches `start` following same-origin redirects up to `cfg.max_redirects` hops. A redirect
 /// to another origin stops the chain (`offsite_redirect`); a loop, a hop limit, a bad Location
 /// or a target robots.txt disallows ends it with an `error`.
-pub fn fetch_page(start: string, cfg: config.Config, policy: robots.Policy) -> Fetched {
+pub fn fetch_page(
+    start: string,
+    cfg: config.Config,
+    policy: robots.Policy,
+    via: Option<http.Pool>
+) -> Fetched {
     let t0 = time.monotonic();
     var current = start;
     var hops: [Hop] = [];
@@ -176,7 +221,7 @@ pub fn fetch_page(start: string, cfg: config.Config, policy: robots.Policy) -> F
     var attempts = 0;
     let origin = urlnorm.origin(start);
     while (true) {
-        let (a, n) = fetch_retrying(current, cfg);
+        let (a, n) = fetch_retrying(current, cfg, via);
         attempts = attempts + n;
         var f = Fetched {
             url: start,
@@ -224,7 +269,7 @@ pub fn fetch_page(start: string, cfg: config.Config, policy: robots.Policy) -> F
 
 /// robots.txt of an origin, with the RFC 9309 status rules: 2xx parsed, 4xx = allow all,
 /// 5xx or unreachable = disallow all. Redirects are followed (up to 5).
-pub fn fetch_robots(origin: string, cfg: config.Config) -> robots.Robots {
+pub fn fetch_robots(origin: string, cfg: config.Config, via: Option<http.Pool>) -> robots.Robots {
     // Config is a struct (reference semantics): change a copy, not the caller's.
     let c = cfg.clone();
     c.max_bytes = 512 * 1024;
@@ -232,14 +277,17 @@ pub fn fetch_robots(origin: string, cfg: config.Config) -> robots.Robots {
     let f = fetch_page(
         "${origin}/robots.txt",
         c,
-        robots.policy_for(robots.allow_all("bootstrap"), cfg.user_agent)
+        robots.policy_for(robots.allow_all("bootstrap"), cfg.user_agent),
+        via
     );
     if (f.offsite_redirect) {
-        // RFC 9309 §2.3.1.2 allows following it; one extra hop off-site is enough here.
+        // RFC 9309 §2.3.1.2 allows following it; one extra hop off-site is enough here (and
+        // off the pool: that one is for this origin).
         let g = fetch_page(
             f.final_url,
             c,
-            robots.policy_for(robots.allow_all("bootstrap"), cfg.user_agent)
+            robots.policy_for(robots.allow_all("bootstrap"), cfg.user_agent),
+            Option.None
         );
         return robots_from(g);
     }
