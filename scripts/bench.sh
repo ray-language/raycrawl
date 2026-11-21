@@ -1,8 +1,8 @@
 #!/bin/sh
 # Throughput of raycrawl against the local fixture site: native vs VM, 1 vs N fetchers per
-# host, 1 vs 4 hosts. Every request is a new TCP connection (the streaming client has no
-# keep-alive), so each run leaves ~PAGES sockets in TIME_WAIT (30 s on macOS): the script waits
-# for them to drain before the next run, otherwise ephemeral ports run out and the numbers lie.
+# host, 1 vs 4 hosts. Each host reuses its connections (http.pool_stream), so a run leaves
+# almost nothing in TIME_WAIT; the drain stays as a guard (a fresh connection per request, as
+# before net 0.17, piled up ~PAGES sockets and ran the ephemeral ports out).
 set -eu
 PAGES=${PAGES:-1500}
 cd "$(dirname "$0")/.."

@@ -241,6 +241,16 @@ pub fn handle(
             page("Flaky ${p} after ${n} hits", "<p>stable now</p>")
         );
     }
+    if (p.starts_with("/retry-after/")) {
+        // One 503 with `Retry-After: <s>` (the last segment), then 200.
+        let n = hit(counter, p);
+        if (n <= 1) {
+            let r = webserver.text(503, "come back later");
+            r.headers.insert("Retry-After", p.substring(13, p.len()));
+            return r;
+        }
+        return webserver.html_response(200, page("Retry-After ${p}", "<p>back</p>"));
+    }
     if (p == "/hits") {
         return webserver.text(200, to_string(hit(counter, req.query) - 1));
     }
